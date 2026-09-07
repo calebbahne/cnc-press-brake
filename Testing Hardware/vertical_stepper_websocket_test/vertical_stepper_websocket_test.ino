@@ -15,8 +15,8 @@
     Click the page to give it keyboard focus.
 
   CONTROLS:
-    Hold U = up.  Release U = stop.
-    Hold D = down. Release D = stop.
+    Hold Shift + U = up. Release either key = stop.
+    Hold Shift + D = down. Release either key = stop.
     M = enter a new maximum speed in the browser prompt (steps/second).
     H = open the on-screen help.
 
@@ -49,20 +49,22 @@ AccelStepper verticalStepper(AccelStepper::DRIVER, VERTICAL_STEP_PIN, VERTICAL_D
 
 float maxSpeed = 400.0f;
 int8_t commandedDirection = 0; // +1 up, -1 down, 0 stopped
+bool shiftEnableHeld = false;
 unsigned long lastHoldMs = 0;
 
 const char CONTROL_PAGE[] PROGMEM = R"HTML(
 <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
 <style>body{font:18px sans-serif;max-width:46rem;margin:2rem auto;padding:0 1rem}kbd{border:1px solid #777;padding:.2rem .5rem;border-radius:.25rem}#state{padding:1rem;background:#eee;white-space:pre-wrap}</style>
 </head><body><h1>Vertical stage stepper test</h1>
-<p>Click here first. Hold <kbd>U</kbd> for up, hold <kbd>D</kbd> for down. Releasing the key stops. <kbd>M</kbd> changes maximum speed; <kbd>H</kbd> shows help.</p>
+<p>Click here first. Hold <kbd>Shift</kbd> + <kbd>U</kbd> for up, or <kbd>Shift</kbd> + <kbd>D</kbd> for down. Releasing either key stops. <kbd>M</kbd> changes maximum speed; <kbd>H</kbd> shows help.</p>
 <p id="state">Connecting…</p><script>
-let ws, held = ''; const state = document.getElementById('state');
+let ws, direction = '', shiftHeld = false; const state = document.getElementById('state');
 function send(m) { if (ws && ws.readyState === WebSocket.OPEN) ws.send(m); }
-function stop() { if (held) send('motion:stop'); held = ''; }
-function connect() { ws = new WebSocket(`ws://${location.hostname}:81/`); ws.onopen=()=>state.textContent='Connected — drivers are disabled until U or D is held.'; ws.onmessage=e=>state.textContent=e.data; ws.onclose=()=>{state.textContent='Disconnected — drivers should be disabled. Retrying…';setTimeout(connect,1000)}; }
-addEventListener('keydown', e => { const k=e.key.toLowerCase(); if ((k==='u'||k==='d') && held!==k) { held=k; send('motion:'+(k==='u'?'up':'down')); e.preventDefault(); } else if(k==='m'&&!e.repeat) { const v=prompt('Maximum speed (steps/second):'); if(v!==null) send('speed:'+v); e.preventDefault(); } else if(k==='h'&&!e.repeat) { alert('Hold U: move up\nHold D: move down\nRelease: stop\nM: change maximum speed\nH: this help'); e.preventDefault(); }});
-addEventListener('keyup', e => { if(e.key.toLowerCase()===held) { stop(); e.preventDefault(); }}); addEventListener('blur',stop); setInterval(()=>{if(held)send('motion:hold')},100); connect();
+function stop() { send('motion:stop'); }
+function updateMotion() { if (shiftHeld && direction) send('motion:'+direction); else stop(); }
+function connect() { ws = new WebSocket(`ws://${location.hostname}:81/`); ws.onopen=()=>state.textContent='Connected — hold Shift plus U or D to enable motion.'; ws.onmessage=e=>state.textContent=e.data; ws.onclose=()=>{state.textContent='Disconnected — drivers should be disabled. Retrying…';setTimeout(connect,1000)}; }
+addEventListener('keydown', e => { const k=e.key.toLowerCase(); if(k==='shift'&&!shiftHeld) { shiftHeld=true; send('enable:shift:down'); updateMotion(); e.preventDefault(); } else if((k==='u'||k==='d')&&direction!==(k==='u'?'up':'down')) { direction=k==='u'?'up':'down'; updateMotion(); e.preventDefault(); } else if(k==='m'&&!e.repeat) { const v=prompt('Maximum speed (steps/second):'); if(v!==null) send('speed:'+v); e.preventDefault(); } else if(k==='h'&&!e.repeat) { alert('Hold Shift + U: move up\nHold Shift + D: move down\nRelease either key: stop\nM: change maximum speed\nH: this help'); e.preventDefault(); }});
+addEventListener('keyup', e => { const k=e.key.toLowerCase(); if(k==='shift') { shiftHeld=false; send('enable:shift:up'); stop(); e.preventDefault(); } else if((k==='u'&&direction==='up')||(k==='d'&&direction==='down')) { direction=''; stop(); e.preventDefault(); }}); addEventListener('blur',()=>{direction='';shiftHeld=false;stop()}); setInterval(()=>{if(shiftHeld&&direction)send('motion:hold')},100); connect();
 </script></body></html>
 )HTML";
 
@@ -89,16 +91,18 @@ void startMotion(int8_t direction) {
 }
 
 void onWebSocketEvent(uint8_t client, WStype_t type, uint8_t *payload, size_t length) {
-  if (type == WStype_DISCONNECTED) { stopMotion("WebSocket disconnected"); return; }
+  if (type == WStype_DISCONNECTED) { shiftEnableHeld = false; stopMotion("WebSocket disconnected"); return; }
   if (type != WStype_TEXT) return;
 
   String message;
   message.reserve(length);
   for (size_t i = 0; i < length; ++i) message += (char)payload[i];
 
-  if (message == "motion:up") startMotion(1);
-  else if (message == "motion:down") startMotion(-1);
-  else if (message == "motion:hold" && commandedDirection != 0) lastHoldMs = millis();
+  if (message == "enable:shift:down") shiftEnableHeld = true;
+  else if (message == "enable:shift:up") { shiftEnableHeld = false; stopMotion("Shift released"); }
+  else if (message == "motion:up" && shiftEnableHeld) startMotion(1);
+  else if (message == "motion:down" && shiftEnableHeld) startMotion(-1);
+  else if (message == "motion:hold" && commandedDirection != 0 && shiftEnableHeld) lastHoldMs = millis();
   else if (message == "motion:stop") stopMotion("key released");
   else if (message.startsWith("speed:")) {
     float requested = message.substring(6).toFloat();

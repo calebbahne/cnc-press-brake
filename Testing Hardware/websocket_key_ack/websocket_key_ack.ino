@@ -6,9 +6,9 @@
   1. Set WIFI_SSID and WIFI_PASSWORD below, upload to the ESP32, then open the
      Serial Monitor at 115200 baud.
   2. Browse to the IP address printed by the ESP32.
-  3. Click the page once, then hold U or D.  The page sends key-down, periodic
-     hold heartbeats, and key-up messages over a WebSocket.  The ESP replies
-     with an acknowledgement displayed in the page and Serial Monitor.
+  3. Click the page once, then hold Shift with U or D. The page sends key-down,
+     periodic hold heartbeats, and key-up messages over a WebSocket. The ESP
+     replies with an acknowledgement displayed in the page and Serial Monitor.
 
   Required Arduino libraries: WiFi (included with ESP32 boards), WebServer,
   and WebSockets by Markus Sattler ("WebSockets" in Library Manager).
@@ -20,8 +20,8 @@
 #include <WebServer.h>
 #include <WebSocketsServer.h>
 
-const char *WIFI_SSID = "REPLACE_WITH_WIFI_NAME";
-const char *WIFI_PASSWORD = "REPLACE_WITH_WIFI_PASSWORD";
+const char *WIFI_SSID = "Rhymes with Donna";
+const char *WIFI_PASSWORD = "!Bbrosgaming2020";
 
 WebServer httpServer(80);
 WebSocketsServer webSocket(81);
@@ -30,9 +30,9 @@ const char CONTROL_PAGE[] PROGMEM = R"HTML(
 <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
 <style>body{font:18px sans-serif;max-width:42rem;margin:2rem auto;padding:0 1rem}kbd{border:1px solid #777;padding:.2rem .5rem;border-radius:.25rem}#state{padding:1rem;background:#eee}</style>
 </head><body><h1>ESP32 keyboard acknowledgement test</h1>
-<p>Click this page, then hold <kbd>U</kbd> or <kbd>D</kbd>. Release the key to stop its heartbeat.</p>
+  <p>Click this page, then hold <kbd>Shift</kbd> with <kbd>U</kbd> or <kbd>D</kbd>. Release either key to stop its heartbeat.</p>
 <p id="state">Connecting…</p><script>
-let ws, held = '';
+let ws, held = '', shiftHeld = false;
 const state = document.getElementById('state');
 function send(message) { if (ws && ws.readyState === WebSocket.OPEN) ws.send(message); }
 function connect() {
@@ -43,14 +43,16 @@ function connect() {
 }
 addEventListener('keydown', e => {
   const key = e.key.toLowerCase();
+  if (key === 'shift' && !shiftHeld) { shiftHeld = true; send('enable:shift:down'); e.preventDefault(); return; }
   if ((key === 'u' || key === 'd') && held !== key) { held = key; send('key:' + key + ':down'); e.preventDefault(); }
 });
 addEventListener('keyup', e => {
   const key = e.key.toLowerCase();
+  if (key === 'shift' && shiftHeld) { shiftHeld = false; send('enable:shift:up'); e.preventDefault(); return; }
   if (key === held) { send('key:' + key + ':up'); held = ''; e.preventDefault(); }
 });
-addEventListener('blur', () => { if (held) send('key:' + held + ':up'); held = ''; });
-setInterval(() => { if (held) send('key:' + held + ':hold'); }, 100);
+addEventListener('blur', () => { if (held) send('key:' + held + ':up'); if (shiftHeld) send('enable:shift:up'); held = ''; shiftHeld = false; });
+setInterval(() => { if (held && shiftHeld) send('key:' + held + ':hold'); }, 100);
 connect();
 </script></body></html>
 )HTML";

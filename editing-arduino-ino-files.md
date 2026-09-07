@@ -27,13 +27,6 @@ Arduino preprocesses `.ino` files before compiling them as C++. Read the sketch 
 
 `delay()` is acceptable in small isolated bring-up tests such as `hello_world.ino`. Avoid it in motion-control firmware, because it prevents responsive serial handling and limit-switch monitoring.
 
-## Target hardware and Arduino settings
-
-- Current controller: ESP8266 (ESP-12E based board).
-- Select the exact ESP8266 board variant and its detected COM port in the Arduino IDE before uploading.
-- USB serial is the link to the React desktop UI.
-- The USB-to-serial bridge may be CP210x or CH340/CH341 depending on the physical development board; do not assume one driver without confirming the device hardware ID or Windows Device Manager entry.
-
 ## Serial protocol direction
 
 The React UI is responsible for operator interaction. The ESP is responsible for executing accepted commands, real-time motion, homing, limit monitoring, and safety behavior. Once the firmware accepts a command, it must continue safely even if the UI becomes unresponsive.
