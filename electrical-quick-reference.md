@@ -13,11 +13,12 @@
   - Two vertical/punch motors share command signals.
   - Two horizontal/backgauge motors share command signals.
   - Lead screws: T8×8 (8 mm lead per revolution).
-- **Drivers:** four BIGTREETECH TMC2209 stepstick drivers (V1.2).
-  - `VM`: 24 V motor supply.
-  - `VCC_IO`: ESP32 `3V3`.
+- **Drivers:** four BIGTREETECH TMC2209 stepstick drivers (V1.3).
+  - `VM`/`VS`: 24 V motor supply (the V1.3 board is rated for 12-28 V DC).
+  - `VIO`: ESP32 `3V3`.
   - `STEP`, `DIR`, `EN`, `PDN_UART`, and optional `DIAG` are logic connections.
   - `EN` is active-low.
+  - BTT specifies active cooling when operating above 1.2 A.
   - Do not connect any motor-supply voltage to ESP32 GPIO.
 
 ## ESP32 pinout — selected assignment
@@ -29,8 +30,8 @@
 | 32 | Horizontal STEP | STEP on both horizontal TMCs |
 | 33 | Horizontal DIR | DIR on both horizontal TMCs |
 | 27 | Global driver enable | EN on all four TMCs |
-| 16 | TMC UART RX | Shared TMC `PDN_UART` bus |
-| 17 | TMC UART TX | Shared `PDN_UART` bus through ~1 kΩ |
+| 16 | TMC UART RX | Shared bus wired directly to `RX` on all four V1.3 TMCs |
+| 17 | TMC UART TX | Same shared bus through ~1 kΩ; do not wire directly to a TMC `TX` pin |
 | 34 | Vertical limit 1 | Left vertical mechanical limit |
 | 35 | Vertical limit 2 | Right vertical mechanical limit |
 | 36 / VP | Horizontal limit 1 | Backgauge home mechanical limit |
@@ -51,11 +52,36 @@ All four drivers share the UART bus but require unique addresses:
 | Driver | MS2 | MS1 | UART address |
 |---|---|---|---:|
 | Vertical 1 | GND | GND | 0 |
-| Vertical 2 | GND | 3V3/VCC_IO | 1 |
-| Horizontal 1 | 3V3/VCC_IO | GND | 2 |
-| Horizontal 2 | 3V3/VCC_IO | 3V3/VCC_IO | 3 |
+| Vertical 2 | GND | 3V3/VIO | 1 |
+| Horizontal 1 | 3V3/VIO | GND | 2 |
+| Horizontal 2 | 3V3/VIO | 3V3/VIO | 3 |
+
+### V1.3 UART wiring
+
+The TMC2209 IC uses one-wire, half-duplex UART. On the BIGTREETECH V1.3 module, the side pin silk-screened `RX` is connected to the IC's `PDN_UART` signal by default. The side pin silk-screened `TX` is not connected by default because the `R10` link is open.
+
+V1.3 physical pin labels (follow the module silk screen if the board is rotated):
+
+| Control side | Power/motor side | Auxiliary top header |
+|---|---|---|
+| `EN`, `MS1`, `MS2`, `RX`, `TX`, `CLK`, `STEP`, `DIR` | `VM`/`VS`, `GND`, `A2`, `A1`, `B1`, `B2`, `VIO`, `GND` | `INDEX`, `DIAG`, `VREF` |
+
+Wire the shared bus as follows:
+
+```text
+ESP32 GPIO17 TX -- ~1 kΩ --+
+                            +-- RX on all four TMC2209 V1.3 modules
+ESP32 GPIO16 RX ------------+
+```
+
+- Leave every TMC module's side `TX` pin disconnected. Do not bridge `R10` for this wiring scheme.
+- Leave `CLK` disconnected; the driver uses its internal clock.
+- The auxiliary pins at the top are `INDEX`, `DIAG`, and `VREF` (some supplied headers may populate only two). Only `DIAG` is used by this project. `INDEX` is unused, and `VREF` is a current-reference/test point, not a UART pin.
+- V1.3 ships in UART mode; no solder modification is required for the default `RX`/`PDN_UART` connection.
 
 UART provides configuration and status from every driver. Individual `DIAG` lines provide immediate stall/error indications. StallGuard is supplemental feedback, not a substitute for mechanical switches.
+
+Sources: [BIGTREETECH TMC2209 V1.3 schematic](https://github.com/bigtreetech/BIGTREETECH-Stepper-Motor-Driver/blob/master/TMC2209/V1.3/Schematic/TMC2209%20V1.3-SCH.pdf) and [V1.3 user manual](https://github.com/bigtreetech/BIGTREETECH-Stepper-Motor-Driver/blob/master/TMC2209/V1.3/manual/BIGTREETECH%20TMC2209%20V1.3%20User%20Manual.pdf).
 
 ## Limit switches
 
