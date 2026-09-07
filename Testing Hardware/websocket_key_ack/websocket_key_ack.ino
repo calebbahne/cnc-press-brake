@@ -5,7 +5,7 @@
 
   1. Set WIFI_SSID and WIFI_PASSWORD below, upload to the ESP32, then open the
      Serial Monitor at 115200 baud.
-  2. Browse to the IP address printed by the ESP32.
+  2. Browse to http://cnc-press-brake.local (or use the printed IP as a fallback).
   3. Click the page once, then hold Shift with U or D. The page sends key-down,
      periodic hold heartbeats, and key-up messages over a WebSocket. The ESP
      replies with an acknowledgement displayed in the page and Serial Monitor.
@@ -19,6 +19,9 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <WebSocketsServer.h>
+#include <ESPmDNS.h>
+
+constexpr char MDNS_HOSTNAME[] = "cnc-press-brake"; // http://cnc-press-brake.local
 
 const char *WIFI_SSID = "Rhymes with Donna";
 const char *WIFI_PASSWORD = "!Bbrosgaming2020";
@@ -80,7 +83,12 @@ void setup() {
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   Serial.print("Connecting to Wi-Fi");
   while (WiFi.status() != WL_CONNECTED) { delay(250); Serial.print('.'); }
-  Serial.printf("\nOpen http://%s in a browser\n", WiFi.localIP().toString().c_str());
+  if (MDNS.begin(MDNS_HOSTNAME)) {
+    MDNS.addService("http", "tcp", 80);
+    Serial.printf("\nOpen http://%s.local in a browser\n", MDNS_HOSTNAME);
+  } else {
+    Serial.printf("\nmDNS failed; open http://%s in a browser\n", WiFi.localIP().toString().c_str());
+  }
 
   httpServer.on("/", []() { httpServer.send_P(200, "text/html", CONTROL_PAGE); });
   httpServer.begin();
