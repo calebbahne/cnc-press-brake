@@ -4,7 +4,8 @@
   Fixed-speed vertical-stepper test. This version does not use AccelStepper:
   it generates STEP pulses directly and starts/stops without acceleration.
 
-  Hold Shift + U = up. Hold Shift + D = down. Release either key = stop.
+  Hold Shift to energize the drivers and hold the motor shafts rigid.
+  Shift + U = up. Shift + D = down. Release either direction key = stop.
   M changes speed in steps/second. A 1000 ms heartbeat timeout stops and
   disables the drivers if browser communication is lost.
 
@@ -22,7 +23,8 @@ constexpr char MDNS_HOSTNAME[] = "cnc-press-brake";
 const char *WIFI_SSID = "Rhymes with Donna";
 const char *WIFI_PASSWORD = "!Bbrosgaming2020";
 
-constexpr uint8_t VERTICAL_STEP_PIN = 25;
+constexpr uint8_t VERTICAL_MOTOR_1_STEP_PIN = 25;
+constexpr uint8_t VERTICAL_MOTOR_2_STEP_PIN = 14;
 constexpr uint8_t VERTICAL_DIR_PIN = 26;
 constexpr uint8_t DRIVER_ENABLE_PIN = 27;
 constexpr bool VERTICAL_DIR_UP_LEVEL = HIGH;
@@ -49,7 +51,7 @@ const char CONTROL_PAGE[] PROGMEM = R"HTML(
 <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
 <style>body{font:18px sans-serif;max-width:46rem;margin:2rem auto;padding:0 1rem}kbd{border:1px solid #777;padding:.2rem .5rem;border-radius:.25rem}.panel{padding:1rem;margin:.7rem 0;border-radius:.4rem;background:#eee;white-space:pre-wrap}.moving{color:#075;background:#dff7ea;font-weight:bold}.stopped{color:#700;background:#f5dddd}.pulse{display:inline-block;width:.8rem;height:.8rem;border-radius:50%;background:#888;margin-right:.5rem}.moving .pulse{background:#0a5;animation:pulse .6s infinite alternate}@keyframes pulse{to{transform:scale(1.5);opacity:.45}}</style>
 </head><body><h1>Vertical stage fixed-speed test</h1>
-<p>This version generates STEP pulses directly—no AccelStepper and no acceleration. Click here first. Hold <kbd>Shift</kbd> + <kbd>U</kbd> for up, or <kbd>Shift</kbd> + <kbd>D</kbd> for down. Releasing either key stops. <kbd>M</kbd> changes speed.</p>
+<p>This version generates STEP pulses directly—no AccelStepper and no acceleration. Click here first. Hold <kbd>Shift</kbd> to energize the motors and hold the shafts rigid. While holding Shift, press <kbd>U</kbd> for up or <kbd>D</kbd> for down. Releasing the direction key stops motion but maintains holding torque. <kbd>M</kbd> changes speed.</p>
 <div id="request" class="panel stopped"><span class="pulse"></span>Browser request: STOPPED</div>
 <div id="state" class="panel stopped"><span class="pulse"></span>ESP32: Connecting…</div><script>
 let ws, direction = '', shiftHeld = false; const state = document.getElementById('state'), request = document.getElementById('request');
@@ -62,7 +64,7 @@ function connect() { ws = new WebSocket(`ws://${location.hostname}:81/`); ws.ono
 addEventListener('keydown', e => { const k=e.key.toLowerCase(); if(k==='shift'&&!shiftHeld) { shiftHeld=true; send('enable:shift:down'); updateMotion(); e.preventDefault(); } else if((k==='u'||k==='d')&&direction!==(k==='u'?'up':'down')) { direction=k==='u'?'up':'down'; updateMotion(); e.preventDefault(); } else if(k==='m'&&!e.repeat) { const v=prompt('Fixed speed (steps/second):'); if(v!==null) send('speed:'+v); e.preventDefault(); }});
 addEventListener('keyup', e => { const k=e.key.toLowerCase(); if(k==='shift') { shiftHeld=false; send('enable:shift:up'); stop(); showRequest(); e.preventDefault(); } else if((k==='u'&&direction==='up')||(k==='d'&&direction==='down')) { direction=''; stop(); showRequest(); e.preventDefault(); }});
 addEventListener('blur',()=>{direction='';shiftHeld=false;stop();showRequest()});
-setInterval(()=>{if(shiftHeld&&direction)send('motion:hold:'+direction)},100); connect();
+setInterval(()=>{if(shiftHeld)send(direction?'motion:hold:'+direction:'enable:shift:hold')},100); connect();
 </script></body></html>
 )HTML";
 
@@ -76,6 +78,7 @@ void updateStepPeriod() {
 
 void sendStatus(uint8_t client, const String &prefix = "") {
   String message = prefix + " direction=" + String(commandedDirection) +
+    " drivers=" + String(shiftEnableHeld ? "enabled" : "disabled") +
     " fixedSpeed=" + String(stepSpeed, 1) + " steps/s";
   webSocket.sendTXT(client, message);
   Serial.println(message);
@@ -84,8 +87,9 @@ void sendStatus(uint8_t client, const String &prefix = "") {
 void stopMotion(const char *reason) {
   commandedDirection = 0;
   stepPulseHigh = false;
-  digitalWrite(VERTICAL_STEP_PIN, LOW);
-  driversEnabled(false);
+  digitalWrite(VERTICAL_MOTOR_1_STEP_PIN, LOW);
+  digitalWrite(VERTICAL_MOTOR_2_STEP_PIN, LOW);
+  driversEnabled(shiftEnableHeld);
   Serial.printf("Stopping immediately: %s\n", reason);
 }
 
@@ -94,7 +98,8 @@ void startMotion(int8_t direction) {
   lastHoldMs = millis();
   digitalWrite(VERTICAL_DIR_PIN,
     direction > 0 ? VERTICAL_DIR_UP_LEVEL : !VERTICAL_DIR_UP_LEVEL);
-  digitalWrite(VERTICAL_STEP_PIN, LOW);
+  digitalWrite(VERTICAL_MOTOR_1_STEP_PIN, LOW);
+  digitalWrite(VERTICAL_MOTOR_2_STEP_PIN, LOW);
   stepPulseHigh = false;
   nextStepRiseUs = micros() + 5; // Give DIR time to settle before the first STEP.
   driversEnabled(true);
@@ -106,14 +111,16 @@ void serviceStepPulses() {
   uint32_t nowUs = micros();
   if (stepPulseHigh) {
     if ((int32_t)(nowUs - pulseLowDueUs) >= 0) {
-      digitalWrite(VERTICAL_STEP_PIN, LOW);
+      digitalWrite(VERTICAL_MOTOR_1_STEP_PIN, LOW);
+      digitalWrite(VERTICAL_MOTOR_2_STEP_PIN, LOW);
       stepPulseHigh = false;
     }
     return;
   }
 
   if ((int32_t)(nowUs - nextStepRiseUs) >= 0) {
-    digitalWrite(VERTICAL_STEP_PIN, HIGH);
+    digitalWrite(VERTICAL_MOTOR_1_STEP_PIN, HIGH);
+    digitalWrite(VERTICAL_MOTOR_2_STEP_PIN, HIGH);
     stepPulseHigh = true;
     pulseLowDueUs = nowUs + STEP_PULSE_WIDTH_US;
     nextStepRiseUs += stepPeriodUs;
@@ -136,7 +143,15 @@ void onWebSocketEvent(uint8_t client, WStype_t type, uint8_t *payload, size_t le
   message.reserve(length);
   for (size_t i = 0; i < length; ++i) message += (char)payload[i];
 
-  if (message == "enable:shift:down") shiftEnableHeld = true;
+  if (message == "enable:shift:down") {
+    shiftEnableHeld = true;
+    lastHoldMs = millis();
+    driversEnabled(true);
+  }
+  else if (message == "enable:shift:hold" && shiftEnableHeld) {
+    lastHoldMs = millis();
+    return;
+  }
   else if (message == "enable:shift:up") {
     shiftEnableHeld = false;
     stopMotion("Shift released");
@@ -172,10 +187,12 @@ void onWebSocketEvent(uint8_t client, WStype_t type, uint8_t *payload, size_t le
 
 void setup() {
   Serial.begin(115200);
-  pinMode(VERTICAL_STEP_PIN, OUTPUT);
+  pinMode(VERTICAL_MOTOR_1_STEP_PIN, OUTPUT);
+  pinMode(VERTICAL_MOTOR_2_STEP_PIN, OUTPUT);
   pinMode(VERTICAL_DIR_PIN, OUTPUT);
   pinMode(DRIVER_ENABLE_PIN, OUTPUT);
-  digitalWrite(VERTICAL_STEP_PIN, LOW);
+  digitalWrite(VERTICAL_MOTOR_1_STEP_PIN, LOW);
+  digitalWrite(VERTICAL_MOTOR_2_STEP_PIN, LOW);
   driversEnabled(false);
   updateStepPeriod();
 
@@ -207,7 +224,8 @@ void loop() {
   webSocket.loop();
   serviceStepPulses();
 
-  if (commandedDirection != 0 && millis() - lastHoldMs > DEADMAN_TIMEOUT_MS) {
+  if (shiftEnableHeld && millis() - lastHoldMs > DEADMAN_TIMEOUT_MS) {
+    shiftEnableHeld = false;
     stopMotion("dead-man timeout");
   }
 }
