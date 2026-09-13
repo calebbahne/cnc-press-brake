@@ -85,8 +85,9 @@ enforce a 2 A limit. The ceiling cannot be raised from the webpage.
 4. Inspect raw SG_RESULT and DIAG rising-edge count. A pulse can be too short
    to see in the live pin state, so the interrupt counter is important.
 5. After basic motion works, allow a jog long enough to reach cruise and settle.
-   The percentage is blank at rest, during precharge/ramp/settling, below the
-   configured sensing minimum, or with invalid telemetry. It is also marked
+   The percentage is replaced by a specific reason at rest, during
+   precharge/ramp/settling, below the configured sensing minimum, or with
+   invalid telemetry. It is also marked
    stale on lost telemetry. Raw SG can retain an old value when idle.
 6. Record lightly loaded and heavily loaded SG values at the intended current,
    speed and direction. Enter those as the 0% and 100% endpoints. Do not provoke
@@ -130,6 +131,10 @@ validated detection threshold for this particular motor.
 - UART status is polled about every 150 ms. Overtemperature/prewarning, shorts,
   undervoltage and unexpected driver reset fault the test. Open-load flags are
   displayed without automatically faulting because they can be spurious at rest.
+- The normal sticky power-on `GSTAT.reset` history flag is cleared before
+  configuration. If it appears later, the sketch reads back the live GCONF,
+  CHOPCONF and PWMCONF settings; matching settings clear the stale flag,
+  while a mismatch latches configuration loss.
 - Faults do not auto-resume. Disable, inspect the cause, Apply/clear, then Arm.
   The first fault is retained until explicit clearing. Commanded position is
   only a pulse count and is unreliable after a stall.
@@ -137,12 +142,10 @@ validated detection threshold for this particular motor.
 
 ## Validation
 
-Compile checked for `esp32:esp32:esp32doit-devkit-v1` using ESP32 core 3.1.1,
-TMCStepper 0.7.3 and WebSockets 2.7.2. Browser-script checks cover settings
-hydration, idle/live load rendering, owner-only heartbeat, jog release, blur
-disable and observer lockout. Not uploaded or tested on the physical motor;
-current draw, pulse timing, torque, SG calibration and DIAG wiring/stop latency
-still require bench verification.
+The browser script was syntax-checked after the latest change. Per the project
+workflow, the final sketch was not compiled or uploaded from chat. It still
+needs Arduino IDE verification and physical bench testing for current draw,
+pulse timing, torque, SG calibration and DIAG wiring/stop latency.
 
 ## References
 

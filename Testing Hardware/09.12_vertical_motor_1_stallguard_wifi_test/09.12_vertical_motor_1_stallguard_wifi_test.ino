@@ -45,6 +45,7 @@ bool ready = false, runHold = false;
 uint32_t drv = 0, gstat = 0, tstep = 0, lastPoll = 0;
 uint16_t sg = 0;
 bool sampleValid = false;
+String loadReason = "motor stopped";
 const char *faultText[] = {"none", "DIAG stall", "NC limit open", "browser watchdog/disconnect",
   "UART/configuration lost", "driver temperature/short/undervoltage", "travel budget reached", "timer unavailable"};
 
@@ -118,6 +119,15 @@ void latchFault(int code) {
   stopMotion(code == 3 || code == 4 || code == 5 || code == 7);
 }
 
+bool configurationMatches() {
+  const uint32_t gc = driver.GCONF();
+  const uint32_t cc = driver.CHOPCONF();
+  const uint32_t pc = driver.PWMCONF();
+  return (gc & 0xC7) == 0xC0 && ((cc >> 24) & 15) == 8 &&
+    !(cc & (1UL << 28)) && (cc & 15) == 4 &&
+    (pc & (3UL << 18)) == (3UL << 18);
+}
+
 bool configureDriver() {
   if (((driver.IOIN() >> 24) & 255) != 0x21 || driver.test_connection() != 0) return false;
   const uint8_t before = driver.IFCNT();
@@ -134,10 +144,10 @@ bool configureDriver() {
   driver.TCOOLTHRS(static_cast<uint32_t>(12000000.0f / (256.0f * cfg.senseMin)));
   driver.VACTUAL(0);
   const uint8_t writes = static_cast<uint8_t>(driver.IFCNT() - before);
-  const uint32_t gc = driver.GCONF(), cc = driver.CHOPCONF(), pc = driver.PWMCONF();
-  // 22 datagrams: rms_current writes CHOPCONF + IHOLD_IRUN twice; others one.
-  const bool ok = writes == 22 && (gc & 0xC7) == 0xC0 && ((cc >> 24) & 15) == 8 &&
-    !(cc & (1UL << 28)) && (cc & 15) == 4 && (pc & (3UL << 18)) == (3UL << 18);
+  const uint32_t gc = driver.GCONF(), cc = driver.CHOPCONF();
+  // Require acknowledged writes and actual register readback. Do not depend on
+  // an exact write count, which can change between TMCStepper library versions.
+  const bool ok = writes > 0 && configurationMatches();
   Serial.printf("CONFIG %s: IFCNT accepted %u writes; GCONF=%08lX CHOPCONF=%08lX\n", ok ? "PASS" : "FAIL", writes, gc, cc);
   runHold = false;
   return ok;
@@ -147,7 +157,7 @@ bool setCurrentMode(bool fullHold) {
   const uint8_t before = driver.IFCNT();
   // Force IHOLD=IRUN before precharge: simply enabling would only give IHOLD.
   driver.rms_current(cfg.current, fullHold ? 1.0f : cfg.hold / 100.0f);
-  if (static_cast<uint8_t>(driver.IFCNT() - before) != 3) { latchFault(4); ready = false; return false; }
+  if (static_cast<uint8_t>(driver.IFCNT() - before) == 0) { latchFault(4); ready = false; return false; }
   runHold = fullHold;
   return true;
 }
@@ -159,12 +169,31 @@ void pollDriver() {
   if (((io >> 24) & 255) != 0x21 || drv == 0xFFFFFFFF || sg > 510) { ready = false; latchFault(4); }
   // DRV_STATUS bits 0..5: otpw, ot, s2ga/b, s2vsa/b. Open-load bits 6/7 are telemetry only.
   if ((drv & 0x3F) || (gstat & 6)) latchFault(5);
-  if ((gstat & 1) && ready) { ready = false; latchFault(4); }
+  if ((gstat & 1) && ready) {
+    // RESET is a sticky history flag and is normally set after power-up. Only
+    // call it configuration loss when the live configuration no longer matches.
+    if (configurationMatches()) {
+      driver.GSTAT(1);
+      gstat = driver.GSTAT();
+    } else {
+      Serial.println("FAULT: GSTAT reset flag set and live configuration no longer matches.");
+      ready = false; latchFault(4);
+    }
+  }
   portENTER_CRITICAL(&mux);
   sampleValid = ready && enabled && direction && sensing && !fault &&
     (drv & (1UL << 30)) && !(drv & (1UL << 31)) && tstep > 0 &&
     tstep <= static_cast<uint32_t>(12000000.0f / (256.0f * cfg.senseMin));
   portEXIT_CRITICAL(&mux);
+  if (fault) loadReason = String("fault: ") + faultText[fault];
+  else if (!ready) loadReason = "driver configuration unavailable";
+  else if (!enabled) loadReason = "outputs disabled";
+  else if (!direction) loadReason = "motor stopped";
+  else if (!sensing) loadReason = velocity < cfg.senseMin ? "below sensing speed" : "accelerating / settling";
+  else if (!(drv & (1UL << 30))) loadReason = "driver is not in StealthChop";
+  else if (drv & (1UL << 31)) loadReason = "driver reports standstill";
+  else if (!tstep) loadReason = "no STEP timing measurement";
+  else loadReason = sampleValid ? "live" : "outside validated sensing window";
 }
 
 String settingsJSON() {
@@ -196,6 +225,7 @@ void sendTelemetry() {
   String s = String("{\"type\":\"status\",\"fault\":\"") + faultText[f] + "\",\"enabled\":" + (e ? "true" : "false") +
     ",\"direction\":" + d + ",\"speed\":" + String(v, 1) + ",\"position\":" + pos +
     ",\"sg\":" + sg + ",\"load\":" + (sampleValid ? String(load, 1) : "null") +
+    ",\"loadReason\":\"" + loadReason + "\"" +
     ",\"diag\":" + digitalRead(DIAG) + ",\"edges\":" + edges + ",\"window\":" + (window ? "true" : "false") +
     ",\"limit1\":" + digitalRead(LIMIT1) + ",\"limit2\":" + digitalRead(LIMIT2) +
     ",\"drv\":\"0x" + String(drv, HEX) + "\",\"gstat\":" + gstat + ",\"tstep\":" + tstep +
@@ -279,12 +309,12 @@ void applySettings() {
   }
   portENTER_CRITICAL(&mux); cfg = next; portEXIT_CRITICAL(&mux);
   ready = false;
+  driver.GSTAT(7);  // Clear old power-up/fault history before applying settings.
   bool ok = configureDriver();
-  // Preserve evidence before explicitly clearing reset/driver history.
-  Serial.printf("Explicit reset: old GSTAT=%lu DRV_STATUS=%08lX\n", driver.GSTAT(), driver.DRV_STATUS());
-  driver.GSTAT(7);
   const uint32_t status = driver.DRV_STATUS();
-  ok = ok && !(status & 0x3F) && !(driver.GSTAT() & 7) && pulseTimer;
+  const uint8_t afterGstat = driver.GSTAT();
+  ok = ok && !(status & 0x3F) && !(afterGstat & 6) && pulseTimer;
+  Serial.printf("APPLY %s: GSTAT=%u DRV_STATUS=%08lX\n", ok ? "PASS" : "FAIL", afterGstat, status);
   portENTER_CRITICAL(&mux); fault = ok ? 0 : 4; portEXIT_CRITICAL(&mux);
   ready = ok; owner = -1;
   http.send(ok ? 200 : 503, "text/plain", ok ? "Applied; fault cleared. Arm explicitly to enable." : "Driver check failed; outputs remain disabled.");
@@ -297,9 +327,10 @@ void setup() {
   Serial.begin(115200);
   uart.begin(115200, SERIAL_8N1, 16, 17);
   driver.begin();
-  ready = configureDriver();
-  Serial.printf("Boot GSTAT=%lu\n", driver.GSTAT());
+  const uint8_t bootGstat = driver.GSTAT();
+  Serial.printf("Boot GSTAT history=%u (reset=1 is normal immediately after power-up)\n", bootGstat);
   driver.GSTAT(7);
+  ready = configureDriver();
   if (!ready) fault = 4;
   attachInterrupt(digitalPinToInterrupt(DIAG), diagISR, RISING);
   esp_timer_create_args_t args = {};

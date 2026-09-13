@@ -31,7 +31,7 @@ function release(){active=false;send('stop')}
 function loseFocus(){release();send('disable')}
 function connect(){ws=new WebSocket(`ws://${location.hostname}:81/`);ws.onopen=()=>{document.getElementById('connection').textContent='Connected; outputs require explicit Arm';lastRx=Date.now()};
 ws.onmessage=e=>{lastRx=Date.now();const s=JSON.parse(e.data);if(s.notice){message.textContent=s.notice;return}if(s.type==='hello'){id=s.id;for(const [k,v] of Object.entries(s.settings)){const el=form.elements[k];if(el.type==='checkbox')el.checked=v;else el.value=v}return}
-owner=s.owner;document.getElementById('load').textContent=s.load===null?'— unavailable':`${s.load.toFixed(1)}%`;
+owner=s.owner;document.getElementById('load').textContent=s.load===null?`— ${s.loadReason||'unavailable'}`:`${s.load.toFixed(1)}%`;
 document.getElementById('meter').value=s.load??0;
 document.getElementById('telemetry').textContent=`Fault: ${s.fault}\nOutputs: ${s.enabled?'ENABLED':'disabled'} | Direction: ${s.direction} | Speed: ${s.speed} full steps/s\nSG_RESULT: ${s.sg} | DIAG: ${s.diag?'HIGH':'LOW'} | DIAG rising edges: ${s.edges}\nSensing window: ${s.window?'settled':'inactive'} | Commanded position: ${s.position} full steps\nNC limit inputs: ${s.limit1}, ${s.limit2} (0 = closed)\nDRV_STATUS: ${s.drv} | GSTAT: ${s.gstat} | TSTEP: ${s.tstep}\nTemperature prewarn: ${s.otpw} | Overtemp: ${s.ot} | Short flags: ${s.shorts}\nOpen-load flags: ${s.openLoad} (may be spurious at rest) | CS_ACTUAL: ${s.cs}`;
 document.getElementById('arm').disabled=s.enabled||s.fault!=='none';for(const k of ['up','down'])document.getElementById(k).disabled=!s.enabled||s.fault!=='none'||owner!==id;
