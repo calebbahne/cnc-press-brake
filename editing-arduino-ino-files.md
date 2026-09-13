@@ -42,3 +42,6 @@ Before modifying a sketch:
 3. Keep a test narrowly scoped: one hardware behavior per test sketch where possible.
 4. Include clear serial output for setup, inputs, commanded actions, and faults.
 5. Review changes for blocking calls, uncontrolled motion, and missing limit checks.
+
+## Testing Hardware Folder
+If you're editing in the Testing Hardware folder, start files with the form MM.DD_Title. Month, day, title.
