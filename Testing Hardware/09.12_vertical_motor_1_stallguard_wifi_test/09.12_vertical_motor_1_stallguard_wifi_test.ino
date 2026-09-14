@@ -17,7 +17,7 @@
 // Same network as 09.07; credentials are filled from that sketch locally.
 const char *WIFI_SSID = "Rhymes with Donna";
 const char *WIFI_PASSWORD = "!Bbrosgaming2020";
-constexpr int STEP = 25, DIR = 26, EN = 27, DIAG = 39;
+constexpr int STEP = 25, DIR = 26, EN = 27, DIAG = 39; // STEP = 25, DIR = 26, EN = 27, DIAG = 39; stepper 1
 constexpr int LIMIT1 = 34, LIMIT2 = 35;
 constexpr uint32_t HEARTBEAT_US = 750000;
 struct Settings {

@@ -21,8 +21,8 @@
 
 #include <Arduino.h>
 
-constexpr uint8_t STEP_PIN = 25;
-constexpr uint8_t DIR_PIN = 26;
+constexpr uint8_t STEP_PIN = 14; // 25 stepper 1
+constexpr uint8_t DIR_PIN = 26; // 26 stepper 1
 constexpr uint8_t ENABLE_PIN = 27;
 
 constexpr uint32_t STEPS_PER_MOVE = 8000;

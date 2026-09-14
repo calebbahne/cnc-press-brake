@@ -10,11 +10,12 @@
 ## Motion hardware
 
 - **Motors:** four NEMA 17 steppers.
-  - Every motor has its own `STEP` signal.
+  - The two vertical/punch motors each have their own `STEP` signal.
+  - The two horizontal/backgauge motors currently share one `STEP` signal on GPIO32.
   - All four drivers share one global `EN` signal.
   - The two vertical/punch motors share one `DIR` signal.
   - The two horizontal/backgauge motors share one `DIR` signal.
-  - Separate STEP signals allow either motor in a pair to stop independently during homing/squaring. A shared enable does not prevent this; it only means the four driver power stages energize or disable together.
+  - Separate vertical STEP signals allow either vertical motor to stop independently during homing/squaring. The horizontal motors currently step and stop together and cannot be independently squared. A shared enable does not prevent independent vertical stepping; it only means the four driver power stages energize or disable together.
   - Lead screws: T8×8 (8 mm lead per revolution).
 - **Drivers:** four BIGTREETECH TMC2209 stepstick drivers (V1.3).
   - `VM`/`VS`: 24 V motor supply (the V1.3 board is rated for 12-28 V DC).
@@ -31,8 +32,8 @@
 | 25 | Vertical motor 1 STEP | STEP on vertical TMC 1 |
 | 14 | Vertical motor 2 STEP | STEP on vertical TMC 2 |
 | 26 | Vertical DIR | DIR on both vertical TMCs |
-| 32 | Horizontal motor 1 STEP | STEP on horizontal TMC 1 |
-| 13 | Horizontal motor 2 STEP | STEP on horizontal TMC 2 |
+| 32 | Shared horizontal STEP | STEP on both horizontal TMCs |
+| 13 | Reserved | Spare GPIO; formerly assigned to horizontal motor 2 STEP |
 | 33 | Horizontal DIR | DIR on both horizontal TMCs |
 | 27 | Global driver enable | EN on all four TMCs |
 | 16 | TMC UART RX | Shared bus wired directly to `RX` on all four V1.3 TMCs |
@@ -50,7 +51,7 @@
 
 Add one external 10 kΩ pull-up from the shared TMC `EN` line to `3V3`. The drivers then remain disabled while the ESP32 is resetting or GPIO27 is floating. Firmware drives GPIO27 LOW only when the motor system is allowed to energize.
 
-If independent enable control becomes useful later, use GPIO21 for the two vertical EN pins and GPIO22 for the two horizontal EN pins. Individual enable per motor is unnecessary for independent stepping or homing because each driver already has its own STEP signal.
+If independent enable control becomes useful later, use GPIO21 for the two vertical EN pins and GPIO22 for the two horizontal EN pins. To independently move, stop, home, or square the horizontal motors, restore a dedicated STEP signal for horizontal motor 2 on GPIO13; splitting enable by axis is not a substitute for separate STEP signals.
 
 ## TMC UART bus
 
@@ -59,8 +60,8 @@ All four drivers share the UART bus but require unique addresses:
 | Driver | MS2 | MS1 | UART address |
 |---|---|---|---:|
 | Vertical 1 | GND | GND | 0 |
-| Vertical 2 | GND | 3V3/VIO | 1 |
-| Horizontal 1 | 3V3/VIO | GND | 2 |
+| Horizontal 1 | 3V3/VIO | GND | 1 |
+| Vertical 2 | GND | 3V3/VIO | 2 |
 | Horizontal 2 | 3V3/VIO | 3V3/VIO | 3 |
 
 ### V1.3 UART wiring
