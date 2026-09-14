@@ -1,0 +1,179 @@
+#pragma once
+const char CONTROL_PAGE[] PROGMEM = R"HTML(
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Four-motor stage test</title>
+<style>
+body{font:16px system-ui;background:#101923;color:#e8eff7;max-width:1100px;margin:25px auto;padding:0 18px}
+h1{font-size:28px}h2{font-size:21px}section,.card{background:#1c2938;border:1px solid #354355;border-radius:12px;padding:18px;margin:16px 0}
+button,input{font:inherit;padding:10px;border-radius:7px;border:1px solid #6c8197}
+button{cursor:pointer;background:#bce8df;color:#102a27;margin:5px}button:disabled{opacity:.4;cursor:default}
+.jog{touch-action:none;user-select:none;padding:16px}.danger{background:#ffb5aa}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:16px}
+label{display:grid;gap:5px;margin:10px 0}input{min-width:0;width:100%;box-sizing:border-box}
+input[type=checkbox]{width:22px;height:22px}small,p{color:#b9c7d6;line-height:1.5}
+pre{white-space:pre-wrap;font-size:14px;overflow-wrap:anywhere}.notice{color:#ffd88a}.position{font-size:28px}
+#message{position:sticky;top:0;background:#263749;padding:12px;min-height:24px;border-radius:8px}
+</style>
+<h1>Four-motor stage test</h1>
+<p>Full steps · StealthChop · interpolation off · CoolStep off · one stage moves at a time</p>
+<div id="message" role="status">Waiting for connection.</div>
+<section><div id="connection">Connecting…</div><pre id="state">Waiting for telemetry</pre>
+<button id="arm" disabled onclick="send('arm')">Arm / hold torque</button>
+<button class="danger" onclick="release();send('disable')">Disable all outputs</button>
+<button class="danger" onclick="release()">STOP both stages</button>
+<p class="notice">No limit switches or homing. Global EN energizes all plugged-in drivers. Support vertical loads: disable, lost connection, or an electrical fault removes holding torque. Stop retains hold current.</p>
+</section>
+<div class="grid" id="stages"></div>
+<section><h2>Driver UART and temperature</h2>
+<p>Only drivers selected at the top of the sketch are queried. Each selected TMC must pass before Arm is allowed. “Seen” means UART responded, not that a motor is connected.</p>
+<p>Temperature is the driver chip's threshold indication, not exact degrees or motor temperature. Thresholds: 120, 143, 150 and 157 °C. Prewarning / shutdown flags are shown separately. SG_RESULT is raw StallGuard data, not measured force.</p>
+<div class="grid" id="drivers"></div></section>
+<section><h2>Settings — all selected drivers</h2>
+<p>Disable outputs before applying. Current, precharge, start speed, step budget and StallGuard settings apply to all selected motors. Vertical and horizontal maximum speed and acceleration are independent. Values are RAM-only and reset on reboot.</p>
+<form id="settings"><div class="grid" id="fields"></div>
+<label><span><input type="checkbox" name="stopDiag"> Stop on active-stage DIAG after reaching sensing speed and settling</span></label>
+<p>Leave DIAG stopping off unless those wires are installed and validated. No limit inputs are used.</p>
+<button type="submit" id="apply">Apply settings / clear fault</button>
+<button type="button" onclick="send('export')">Print applied settings to Serial</button></form>
+<p>Current is per-motor RMS winding current, not supply current. The inactive stage stays at hold current. Only the moving stage receives stationary run-current precharge.</p>
+</section>
+<script>
+const $=id=>document.getElementById(id);
+const form=$('settings'), message=$('message');
+const specs=[
+['current','Run current per motor (mA RMS)',300,1000,600],
+['hold','Hold current (%)',30,100,50],
+['precharge','Stationary precharge (ms)',100,2000,400],
+['vSpeed','Vertical max speed (steps/s)',20,600,250],
+['vAccel','Vertical acceleration (steps/s²)',10,1000,100],
+['hSpeed','Horizontal max speed (steps/s)',20,600,250],
+['hAccel','Horizontal acceleration (steps/s²)',10,1000,100],
+['start','Starting / final speed (steps/s)',5,100,20],
+['maxTravel','Maximum steps per command / jog',1,100000,600],
+['sgthrs','SGTHRS',0,255,0],
+['senseMin','DIAG sensing minimum (steps/s)',50,600,200],
+['settle','Settling at max speed (ms)',100,2000,300]];
+for(const [name,label,min,max,value] of specs){
+ const l=document.createElement('label');l.textContent=label;
+ const i=document.createElement('input');Object.assign(i,{name,type:'number',min,max,value,step:1,required:true});
+ l.append(i);$('fields').append(l);
+}
+for(const [a,title] of [['v','Vertical'],['h','Horizontal']]){
+ const section=document.createElement('section');
+ section.innerHTML='<h2>'+title+' pair</h2><div class="position" id="'+a+'pos">—</div><p id="'+a+'zero">Zero not set</p>'+
+ '<button data-motion id="'+a+'zeroButton">Set '+title.toLowerCase()+' zero here</button>'+
+ '<p>Hold to jog; release to stop. + / − follow the configured motor direction.</p>'+
+ '<button data-motion class="jog" id="'+a+'minus">Hold −</button><button data-motion class="jog" id="'+a+'plus">Hold +</button>'+
+ '<label>Increment (full steps)<input id="'+a+'increment" type="number" min="1" max="100000" step="1" value="100"></label>'+
+ '<button data-motion id="'+a+'stepMinus">Move − increment</button><button data-motion id="'+a+'stepPlus">Move + increment</button>'+
+ '<label>Absolute position from this stage zero (full steps)<input id="'+a+'target" type="number" min="-1000000000" max="1000000000" step="1" value="0"></label>'+
+ '<button data-motion data-absolute id="'+a+'go">Go to position</button><button data-motion data-absolute id="'+a+'home">Return to zero</button>';
+ $('stages').append(section);
+ $(a+'zeroButton').onclick=()=>send('zero:'+a);
+ $(a+'stepMinus').onclick=()=>move(a,false,-1);$(a+'stepPlus').onclick=()=>move(a,false,1);
+ $(a+'go').onclick=()=>move(a,true,1);$(a+'home').onclick=()=>send('goto:'+a+':0');
+}
+let socket,id=-1,owner=-1,lastRx=0,status=null,activeJog=null;
+function send(s){if(socket?.readyState===1)socket.send(s)}
+function release(){activeJog=null;send('stop')}
+function loseFocus(){if(owner===id){release();send('disable')}}
+function move(a,absolute,sign){
+ const el=$(a+(absolute?'target':'increment'));
+ if(!el.reportValidity())return;
+ const value=Number(el.value);
+ if(!Number.isSafeInteger(value)){message.textContent='Enter a whole number of full steps.';return}
+ send((absolute?'goto':'step')+':'+a+':'+(absolute?value:sign*value));
+}
+function renderControls(){
+ const fresh=socket?.readyState===1 && status && Date.now()-lastRx<1000;
+ const mine=fresh && status.enabled && status.fault==='none' && owner===id;
+ $('arm').disabled=!fresh||status.enabled||!status.ready||status.fault!=='none';
+ $('apply').disabled=!fresh||status.enabled;
+ for(const [axis,a] of ['v','h'].entries()){
+  const selected=fresh && status.drivers.slice(axis*2,axis*2+2).some(d=>d.selected);
+  for(const b of $(a+'pos').parentElement.querySelectorAll('[data-motion]')){
+   b.disabled=!mine||!selected||status.axis!==-1||(b.dataset.absolute!==undefined&&!status.zeroed[axis]);
+   if(mine&&selected&&b.id===activeJog)b.disabled=false;
+  }
+ }
+}
+function renderStatus(s){
+ status=s;owner=s.owner;
+ $('state').textContent='Fault: '+s.fault+'\nOutputs: '+(s.enabled?'ENABLED':'disabled')+
+ ' | Moving: '+(s.axis<0?'none':['vertical','horizontal'][s.axis])+' | Speed: '+s.speed+' steps/s | Remaining: '+s.remaining+
+ '\nControl: '+(owner<0?'unclaimed':owner===id?'this browser':'another browser')+' | DIAG window: '+(s.window?'active':'inactive');
+ ['v','h'].forEach((a,i)=>{
+  $(a+'pos').textContent=s.position[i]+' commanded full steps';
+  $(a+'zero').textContent=s.zeroed[i]?'Zero set — absolute moves available':'Zero not set — Arm, stop, then set zero.';
+ });
+ $('drivers').replaceChildren();
+ for(const d of s.drivers){
+  const card=document.createElement('div');card.className='card';
+  const pre=document.createElement('pre');
+  let detail='Skipped — declared unplugged in sketch; not queried.';
+  if(d.selected&&!d.seen)detail='UART NOT SEEN — temperature/status unavailable.';
+  else if(d.selected&&d.age>1500)detail='STALE UART sample — temperature/status unavailable.';
+  else if(d.selected){
+   const r=d.drv>>>0, bits=[8,9,10,11].map(b=>(r>>>b)&1);
+   const band=bits[3]?'≥157 °C':bits[2]?'150–157 °C':bits[1]?'143–150 °C':bits[0]?'120–143 °C':'below 120 °C threshold';
+   detail='UART SEEN | Config: '+(d.configured?'PASS':'FAIL')+' | Sample: '+d.age+' ms old\nChip temperature indication: '+band+
+   '\nThreshold flags 120/143/150/157 °C: '+bits.join('/')+'\nPrewarning: '+(r&1)+' | Overtemperature: '+((r>>>1)&1)+
+   '\nShort flags: '+((r>>>2)&15)+' | Open load: '+((r>>>6)&3)+'\nSG_RESULT: '+d.sg+' | DIAG: '+d.diag+' | Edges: '+d.edges+
+   '\nDRV_STATUS: 0x'+r.toString(16).padStart(8,'0')+' | GSTAT: '+d.gstat;
+  }
+  pre.textContent=d.name+' — UART address '+d.address+'\n'+detail;card.append(pre);$('drivers').append(card);
+ }
+ renderControls();
+}
+function connect(){
+ socket=new WebSocket('ws://'+location.hostname+':81/');
+ socket.onopen=()=>{lastRx=Date.now();$('connection').textContent='Connected — explicit Arm required';message.textContent='Connected.'};
+ socket.onmessage=e=>{
+  const s=JSON.parse(e.data);lastRx=Date.now();
+  if(s.notice){message.textContent=s.notice;return}
+  if(s.type==='hello'){id=s.id;for(const [k,v] of Object.entries(s.settings)){
+   const el=form.elements[k];if(!el)continue;if(el.type==='checkbox')el.checked=v;else el.value=v;
+  }return}
+  if(s.type==='status')renderStatus(s);
+ };
+ socket.onclose=()=>{
+  activeJog=null;owner=-1;status=null;renderControls();
+  $('connection').textContent='Disconnected — reconnecting; re-arm and re-zero required';
+  $('state').textContent='No live telemetry';$('drivers').textContent='UART / temperature data unavailable while disconnected.';
+  for(const a of ['v','h']){$(a+'pos').textContent='—';$(a+'zero').textContent='Disconnected';}
+  setTimeout(connect,1500);
+ };
+}
+for(const a of ['v','h'])for(const [suffix,sign] of [['minus','-'],['plus','+']]){
+ const b=$(a+suffix);
+ b.onpointerdown=e=>{
+  if(activeJog||b.disabled||e.button!==0)return;
+  e.preventDefault();b.setPointerCapture(e.pointerId);activeJog=b.id;send('jog:'+a+':'+sign);
+ };
+ b.onpointerup=()=>{if(activeJog===b.id)release()};
+ b.onpointercancel=()=>{if(activeJog===b.id)release()};
+ b.onlostpointercapture=()=>{if(activeJog===b.id)release()};
+}
+addEventListener('blur',loseFocus);addEventListener('pagehide',loseFocus);
+document.addEventListener('visibilitychange',()=>{if(document.hidden)loseFocus()});
+addEventListener('keydown',e=>{
+ if(e.code==='Escape'||(e.code==='Space'&&!['INPUT','TEXTAREA'].includes(e.target.tagName))){e.preventDefault();release()}
+});
+setInterval(()=>{
+ if(owner===id&&!document.hidden&&Date.now()-lastRx<600)send('beat');
+ renderControls();
+ if(status&&Date.now()-lastRx>=1000){
+  $('connection').textContent='Stale telemetry — motion controls locked';
+  $('drivers').textContent='UART / temperature data stale.';
+ }else if(status)$('connection').textContent='Connected';
+},100);
+form.onsubmit=async e=>{
+ e.preventDefault();
+ const data=new URLSearchParams(new FormData(form));data.set('stopDiag',form.elements.stopDiag.checked?'1':'0');
+ try{const r=await fetch('/settings',{method:'POST',body:data});message.textContent=await r.text()}
+ catch{message.textContent='Connection failed; settings not confirmed'}
+};
+renderControls();connect();
+</script></html>
+)HTML";
+

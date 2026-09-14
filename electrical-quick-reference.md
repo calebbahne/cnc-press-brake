@@ -119,3 +119,7 @@ GPIO21 and GPIO22 remain available. They may be used as two additional direct li
 For the first two additional mechanical limits, use GPIO21 and GPIO22. If more are required, next reassign GPIO19 and/or GPIO23 from the second drivers' `DIAG` signals. UART status from all four drivers and the primary vertical/horizontal DIAG signals will remain available.
 
 For larger expansion, retain GPIO21 and GPIO22 as SDA/SCL for an MCP23017 I²C I/O expander. Keep STEP, DIR, EN, the three primary mechanical limits, and the TMC DIAG signals directly on the ESP32.
+
+## Lead Screw Lengths
+Usable horizontal lead screw: 1200 full steps (48mm).
+Usable vertical lead screw: 625 full steps.
