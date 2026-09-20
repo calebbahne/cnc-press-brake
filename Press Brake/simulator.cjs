@@ -1,0 +1,31 @@
+// Hardware-free protocol 2 simulator. Does not connect to any physical controller.
+const http=require('node:http'),crypto=require('node:crypto'),B=require('./ui/model.js');
+function frame(value){const b=Buffer.from(typeof value==='string'?value:JSON.stringify(value));if(b.length<126)return Buffer.concat([Buffer.from([0x81,b.length]),b]);const h=Buffer.alloc(4);h[0]=0x81;h[1]=126;h.writeUInt16BE(b.length,2);return Buffer.concat([h,b]);}
+function createSimulator(){
+  let cfg={...B.settings},owner=-1,enabled=false,fault='none',position=[0,0],zeroed=[false,false],axis=-1,moveId=0,completedId=0,target=0,speed=0,beatAt=0,holdAt=0,nextClient=1,home=false;
+  const clients=new Map();
+  const write=(socket,obj)=>{if(!socket.destroyed)socket.write(frame(obj));};
+  function stop(disable=false){axis=-1;moveId=0;speed=0;home=false;if(disable){enabled=false;owner=-1;zeroed=[false,false];}}
+  function telemetry(){return {type:'status',protocol:2,stepsPerMm:200,simulation:true,fault,enabled,ready:true,axis,speed,remaining:axis<0?0:Math.abs(target-position[axis]),owner,position:[...position],zeroed:[...zeroed],moveId,completedId,homing:home?1:0,limits:[0,0,0],settings:cfg,drivers:['Vertical 1','Vertical 2','Horizontal 1','Horizontal 2'].map((name,i)=>({name,address:[0,2,1,3][i],selected:true,seen:true,configured:true,age:0,drv:0,gstat:0,sg:0,diag:0,edges:0}))};}
+  const server=http.createServer((req,res)=>{if(req.url!=='/settings'||req.method!=='POST'){res.writeHead(404);res.end();return;}let body='';req.on('data',b=>body+=b);req.on('end',()=>{try{if(enabled)throw Error('Disable outputs before applying.');const p=new URLSearchParams(body),next={};for(const [k]of B.fields)next[k]=Number(p.get(k));for(const k of ['limitHoming','stopDiag'])next[k]=p.get(k)==='1';B.validateSettings(next);cfg=next;fault='none';res.end('Simulator settings applied. Arm explicitly.');}catch(e){res.writeHead(400);res.end(e.message);}});});
+  function command(socket,id,message){let token=0,op=message;const bar=message.indexOf('|');if(bar>=0){token=Number(message.slice(0,bar));op=message.slice(bar+1);}const reply=(ok,message)=>write(socket,token?{type:'result',id:token,ok,message}:{notice:message});
+    if(op==='stop'){stop();return;}if(op==='disable'){stop(true);return;}if(op==='beat'&&owner===id){beatAt=Date.now();return;}if(op.startsWith('hold:')&&owner===id){if(Number(op.slice(5))===moveId)holdAt=Date.now();return;}
+    if(owner>=0&&owner!==id){reply(false,'Another browser owns the controls.');return;}
+    if(op==='arm'){if(enabled||fault!=='none'){reply(false,'Clear fault while disabled.');return;}enabled=true;owner=id;beatAt=Date.now();return;}
+    if(op==='export'){reply(true,'Simulation settings printed (no hardware).');return;}
+    const [kind,a,value]=op.split(':'),i=a==='v'?0:1;
+    if(!enabled||fault!=='none'||axis!==-1||owner!==id){reply(false,'Arm and stop first.');return;}
+    if(kind==='zero'){if(cfg.limitHoming){reply(false,'Use switch home.');return;}position[i]=0;zeroed[i]=true;reply(true,'Manual home set.');return;}
+    if(!['goto','step','home'].includes(kind)||!token){reply(false,'Identified move required.');return;}
+    if(kind==='home'){if(!cfg.limitHoming){reply(false,'Switch homing disabled.');return;}home=true;zeroed[i]=false;target=cfg.homeBackoff;}
+    else {target=kind==='goto'?Number(value):position[i]+Number(value);if(!Number.isSafeInteger(target)||(kind==='goto'&&!zeroed[i])||(!zeroed[i]&&Math.abs(target-position[i])>200)||Math.abs(target-position[i])>cfg.maxTravel||(zeroed[i]&&(target<0||target>(i===0?Math.min(cfg.vMax,cfg.toolMax):cfg.hMax)))){reply(false,'Target exceeds homing / travel requirements.');return;}}
+    moveId=token;holdAt=Date.now();axis=i;speed=i===0?cfg.vSpeed:cfg.hSpeed;reply(true,'Move accepted.');
+  }
+  server.on('upgrade',(req,socket,head)=>{const id=nextClient++;socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: '+crypto.createHash('sha1').update(req.headers['sec-websocket-key']+'258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64')+'\r\n\r\n');clients.set(id,socket);write(socket,{type:'hello',id,protocol:2,stepsPerMm:200,simulation:true,settings:cfg});let buffer=Buffer.alloc(0);
+    function receive(chunk){buffer=Buffer.concat([buffer,chunk]);while(buffer.length>=2){const code=buffer[0]&15,masked=buffer[1]&128;let len=buffer[1]&127,offset=2;if(len===126){if(buffer.length<4)return;len=buffer.readUInt16BE(2);offset=4;}if(len===127||len>4096){socket.destroy();return;}const header=offset+(masked?4:0);if(buffer.length<header+len)return;let data=Buffer.from(buffer.subarray(header,header+len));if(masked)for(let i=0;i<data.length;i++)data[i]^=buffer[offset+i%4];buffer=buffer.subarray(header+len);if(code===8){socket.end();return;}if(code===1)command(socket,id,data.toString());}}
+    socket.on('data',receive);if(head.length)receive(head);socket.on('error',()=>{});socket.on('close',()=>{clients.delete(id);if(owner===id){fault='browser watchdog/disconnect';stop(true);}});
+  });
+  const timer=setInterval(()=>{const now=Date.now();if(enabled&&now-beatAt>2000){fault='browser watchdog/disconnect';stop(true);}if(axis>=0&&now-holdAt>350){fault='motion hold expired';zeroed=[false,false];stop();}if(axis>=0){const step=Math.max(1,Math.round(speed*.04));position[axis]+=Math.sign(target-position[axis])*Math.min(step,Math.abs(target-position[axis]));if(position[axis]===target){if(home)zeroed[axis]=true;completedId=moveId;stop();}}for(const socket of clients.values())write(socket,telemetry());},40);
+  server.shutdown=()=>{clearInterval(timer);for(const s of clients.values())s.destroy();server.close();};return server;
+}
+module.exports={createSimulator,frame};
