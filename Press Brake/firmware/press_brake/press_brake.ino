@@ -3,16 +3,11 @@
    Global EN energizes all physically connected drivers; support vertical loads.
 */
 #include <Arduino.h>
-#include <WiFi.h>
-#include <WebServer.h>
-#include <WebSocketsServer.h>
-#include <ESPmDNS.h>
 #include <TMCStepper.h>
 #include <esp_timer.h>
 #include <math.h>
 #include <errno.h>
-#include <Preferences.h>
-// UI is served by the computer; this ESP exposes only the command/status API.
+// The PC serves the UI and relays its commands over the programming USB cable.
 
 // EDIT THESE FOUR SWITCHES BEFORE UPLOADING. False means physically unplugged.
 // Never unplug drivers/motors under power. A false switch is NOT electrical isolation.
@@ -28,7 +23,6 @@ constexpr bool INVERT_H1 = false, INVERT_H2 = false;
 // Increase this if brief Wi-Fi/browser delays cause watchdog faults.
 constexpr uint32_t BROWSER_WATCHDOG_MS = 8000;
 
-#include "wifi_secrets.h"
 constexpr int MICROSTEPS = 8;
 constexpr int STEPS_PER_MM = 200; // 200 motor full steps/rev * 8 microsteps / 8 mm lead.
 constexpr int LIMIT_PINS[3] = {34,35,36}; // NC to GND, external pull-ups; HIGH = tripped/open.
@@ -55,17 +49,15 @@ HardwareSerial uart(2);
 TMC2209Stepper v1(&uart, 0.110f, 0), v2(&uart, 0.110f, 2);
 TMC2209Stepper h1(&uart, 0.110f, 1), h2(&uart, 0.110f, 3);
 TMC2209Stepper *drivers[4] = {&v1, &v2, &h1, &h2};
-WebServer http(80);
-WebSocketsServer ws(81);
 esp_timer_handle_t pulseTimer = nullptr;
 portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
 // Timer-shared state: always access under mux. UART/network only in loop().
 bool enabled = false, sensing = false;
+bool manualMoveActive = false;
 uint32_t requestId = 0, activeMove = 0, completedMove = 0;
 int64_t holdAt = 0, homeStarted = 0, homeContactAt = 0;
 int homing = 0, homePulses = 0, skewPulses = 0;
 bool homeHit[2] = {false,false};
-bool setupAP = false;
 int activeAxis = -1, direction = 0, fault = 0;
 int32_t position[2] = {0, 0}, remaining = 0;
 bool zeroed[2] = {false, false};
@@ -82,7 +74,7 @@ uint8_t ifcntBefore[4] = {}, ifcntAfter[4] = {};
 bool configMatch[4] = {};
 uint16_t sg[4] = {};
 int owner = -1, runHoldAxis = -1;
-const char *faultText[] = {"none", "DIAG stall", "browser watchdog/disconnect",
+const char *faultText[] = {"none", "DIAG stall", "USB/browser watchdog/disconnect",
   "UART/configuration lost", "driver temperature/short/undervoltage", "timer unavailable", "limit input triggered", "homing failed", "motion hold expired"};
 
 void stepsLow() {
@@ -91,7 +83,7 @@ void stepsLow() {
 void haltLocked(bool disable) {
   if (homing && activeAxis >= 0) zeroed[activeAxis] = false;
   homing = 0; activeMove = 0;
-  activeAxis = -1; direction = 0; velocity = 0; remaining = 0; sensing = false;
+  activeAxis = -1; direction = 0; velocity = 0; remaining = 0; sensing = false; manualMoveActive = false;
   cruiseSince = 0; stepsLow();
   if (disable) {
     enabled = false; digitalWrite(EN, HIGH);
@@ -175,7 +167,7 @@ void motionTick(void *) {
     fault=6; zeroed[a]=false; haltLocked(false); portEXIT_CRITICAL(&mux); return;
   }
   const int32_t nextPos = position[a] + direction;
-  if (zeroed[a] && (nextPos<0 || nextPos>(a==0 ? min(cfg.vMax,cfg.toolMax) : cfg.hMax))) {
+  if (zeroed[a] && !manualMoveActive && (nextPos<0 || nextPos>(a==0 ? min(cfg.vMax,cfg.toolMax) : cfg.hMax))) {
     haltLocked(false); portEXIT_CRITICAL(&mux); return;
   }
   const float maxSpeed = moveSpeedCap;
@@ -300,13 +292,13 @@ bool parseNumber(const String &raw, long low, long high, long &value) {
 }
 void acknowledge(uint8_t client, bool ok, const char *message) {
   String s=String("{\"type\":\"result\",\"id\":")+requestId+",\"ok\":"+(ok?"true":"false")+",\"message\":\""+message+"\"}";
-  ws.sendTXT(client,s);
+  Serial.print('@'); Serial.println(s);
 }
 void notice(uint8_t client, const char *message) {
   if (requestId) { acknowledge(client,false,message); return; }
-  String s = String("{\"notice\":\"") + message + "\"}"; ws.sendTXT(client, s);
+  String s = String("{\"notice\":\"") + message + "\"}"; Serial.print('@'); Serial.println(s);
 }
-void startMove(uint8_t client, int axis, long amount, bool absolute, bool isHome, int speedLimit = 0) {
+void startMove(uint8_t client, int axis, long amount, bool absolute, bool isHome, int speedLimit = 0, bool manualFree = false) {
   portENTER_CRITICAL(&mux);
   const bool allowed = enabled && !fault && activeAxis < 0 && owner == client;
   const int32_t pos = position[axis];
@@ -326,8 +318,8 @@ void startMove(uint8_t client, int axis, long amount, bool absolute, bool isHome
   if (delta > cfg.maxTravel || delta < -cfg.maxTravel || target > POSITION_BOUND || target < -POSITION_BOUND) {
     notice(client, "Move exceeds the per-command step budget or position range."); return;
   }
-  if (!isHome && !hasZero && (absolute || abs(amount)>STEPS_PER_MM)) { notice(client,"Unhomed: use held setup increments of at most 1 mm, then set home."); return; }
-  if (!isHome && hasZero && (target<0 || target>(axis==0 ? min(cfg.vMax,cfg.toolMax) : cfg.hMax))) { notice(client,"Target exceeds machine/tool travel envelope."); return; }
+  if (!isHome && !manualFree && !hasZero && (absolute || abs(amount)>STEPS_PER_MM)) { notice(client,"Unhomed: use held setup increments of at most 1 mm, then set home."); return; }
+  if (!isHome && !manualFree && hasZero && (target<0 || target>(axis==0 ? min(cfg.vMax,cfg.toolMax) : cfg.hMax))) { notice(client,"Target exceeds machine/tool travel envelope."); return; }
   if (!delta && !isHome) {
     portENTER_CRITICAL(&mux); completedMove=requestId; portEXIT_CRITICAL(&mux);
     acknowledge(client,true,"Already at target."); return;
@@ -335,7 +327,7 @@ void startMove(uint8_t client, int axis, long amount, bool absolute, bool isHome
   if (!setCurrentMode(axis)) return;
   portENTER_CRITICAL(&mux);
   if (enabled && !fault && activeAxis < 0) {
-    activeMove=requestId; holdAt=esp_timer_get_time();
+    activeMove=requestId; holdAt=esp_timer_get_time(); manualMoveActive=manualFree;
     activeAxis = axis; direction = delta > 0 ? 1 : -1;
     if (isHome) {
       homing=1; zeroed[axis]=false; homeHit[0]=homeHit[1]=false;
@@ -398,23 +390,26 @@ void sendTelemetry() {
   }
   s += "],\"protocol\":2,\"stepsPerMm\":"+String(STEPS_PER_MM)+",\"moveId\":"+move+",\"completedId\":"+done+",\"homing\":"+home;
   s += ",\"limits\":["+String(digitalRead(34))+","+String(digitalRead(35))+","+String(digitalRead(36))+"]";
-  s += ",\"wifiMode\":\""+String(setupAP ? "setup" : (WiFi.status()==WL_CONNECTED ? "station" : "connecting"))+"\"";
-  s += ",\"settings\":"+settingsJSON()+"}"; ws.broadcastTXT(s);
+  s += ",\"transport\":\"usb\"";
+  s += ",\"settings\":"+settingsJSON()+"}"; Serial.print('@'); Serial.println(s);
 }
 void exportSettings() {
   Serial.println("Applied settings (RAM only):"); Serial.println(settingsJSON());
   for (int i = 0; i < 4; ++i)
     Serial.printf("%s address=%d selected=%d seen=%d configured=%d\n", NAMES[i], ADDRESS[i], PRESENT[i], seen[i], configured[i]);
 }
-void onSocket(uint8_t client, WStype_t type, uint8_t *payload, size_t length) {
+enum LinkEvent { LINK_DISCONNECTED, LINK_CONNECTED, LINK_TEXT };
+void onLink(uint8_t client, int type, const String &input) {
   requestId=0;
-  if (type == WStype_DISCONNECTED && owner == client) { latchFault(2); owner = -1; return; }
-  if (type == WStype_CONNECTED) {
+  if (type == LINK_DISCONNECTED && owner == client) { latchFault(2); owner = -1; return; }
+  if (type == LINK_CONNECTED) {
+    // A new browser session must never inherit an armed session after a quick USB reconnect.
+    if (owner == client) { latchFault(2); owner = -1; }
     String s = String("{\"type\":\"hello\",\"id\":") + client + ",\"protocol\":2,\"stepsPerMm\":"+String(STEPS_PER_MM)+",\"settings\":" + settingsJSON() + "}";
-    ws.sendTXT(client, s); return;
+    Serial.print('@'); Serial.println(s); return;
   }
-  if (type != WStype_TEXT || length > 96) return;
-  String m; for (size_t i = 0; i < length; ++i) m += char(payload[i]);
+  if (type != LINK_TEXT || input.length() > 96) return;
+  String m = input;
   if (m.startsWith("hold:")) {
     long id;
     if (owner==client && parseNumber(m.substring(5),1,2147483647,id)) {
@@ -427,7 +422,6 @@ void onSocket(uint8_t client, WStype_t type, uint8_t *payload, size_t length) {
     long id; if (!parseNumber(m.substring(0,bar),1,2147483647,id)) return;
     requestId=uint32_t(id); m=m.substring(bar+1);
   }
-  if (setupAP && m!="stop" && m!="disable" && m!="export") { notice(client,"Wi-Fi setup mode: motion unavailable."); return; }
   if (m == "disable") { stopMotion(true); owner = -1; return; }
   if (m == "stop") { stopMotion(false); return; }
   if (m == "export") { exportSettings(); notice(client, "Applied settings printed to Serial."); return; }
@@ -469,25 +463,34 @@ void onSocket(uint8_t client, WStype_t type, uint8_t *payload, size_t length) {
     long speed;
     const int stageMax = axis == 0 ? cfg.vSpeed : cfg.hSpeed;
     if (!parseNumber(raw.substring(2),cfg.start,stageMax,speed)) { notice(client,"Jog speed is outside the configured stage range."); return; }
-    portENTER_CRITICAL(&mux);
-    const int32_t pos = position[axis]; const bool hasZero = zeroed[axis];
-    portEXIT_CRITICAL(&mux);
-    if (!hasZero) { notice(client,"Set this stage home before continuous jog."); return; }
-    const int32_t limit = axis == 0 ? min(cfg.vMax,cfg.toolMax) : cfg.hMax;
-    const long available = raw[0] == '+' ? limit - pos : pos;
-    if (available <= 0) { notice(client,"Jog is already at the travel boundary."); return; }
-    const long distance = available < cfg.maxTravel ? available : cfg.maxTravel;
-    startMove(client,axis,(raw[0] == '+' ? 1 : -1) * distance,false,false,int(speed));
+    // Held manual jog has a per-command budget, but no assumed physical home/end stops.
+    startMove(client,axis,(raw[0] == '+' ? 1 : -1) * cfg.maxTravel,false,false,int(speed),true);
     return;
   }
   long value;
-  if ((op == "step" || op == "goto") && parseNumber(raw, -POSITION_BOUND, POSITION_BOUND, value))
-    startMove(client, axis, value, op == "goto", false);
+  if ((op == "step" || op == "goto" || op == "manual") && parseNumber(raw, -POSITION_BOUND, POSITION_BOUND, value))
+    startMove(client, axis, value, op == "goto", false, 0, op == "manual");
   else notice(client, "Invalid command or integer step value.");
 }
-void applySettings() {
+String formArg(const String &form, const char *key) {
+  const String needle = String(key) + "=";
+  int at = 0;
+  while (at < form.length()) {
+    const int end = form.indexOf('&', at);
+    const int stop = end < 0 ? form.length() : end;
+    if (form.substring(at, stop).startsWith(needle)) return form.substring(at + needle.length(), stop);
+    at = stop + 1;
+  }
+  return "";
+}
+void settingsReply(long id, int code, const char *message) {
+  Serial.print(F("@{\"type\":\"settingsResult\",\"id\":")); Serial.print(id);
+  Serial.print(F(",\"code\":")); Serial.print(code);
+  Serial.print(F(",\"message\":\"")); Serial.print(message); Serial.println(F("\"}"));
+}
+void applySettings(const String &form, long id) {
   portENTER_CRITICAL(&mux); const bool busy = enabled || activeAxis >= 0; portEXIT_CRITICAL(&mux);
-  if (busy) { http.send(409, "text/plain", "Disable outputs before applying."); return; }
+  if (busy) { settingsReply(id,409,"Disable outputs before applying."); return; }
   Settings next = cfg;
   struct Field { const char *name; int *value; int low; int high; } fields[] = {
     {"current",&next.current,300,1000}, {"hold",&next.hold,30,100},
@@ -501,20 +504,20 @@ void applySettings() {
   };
   for (auto &field : fields) {
     long value;
-    if (!parseNumber(http.arg(field.name), field.low, field.high, value)) {
-      http.send(400, "text/plain", String("Invalid ") + field.name); return;
+    if (!parseNumber(formArg(form,field.name), field.low, field.high, value)) {
+      settingsReply(id,400,"Invalid motion setting."); return;
     }
     *field.value = value;
   }
   if (next.start > next.vSpeed || next.start > next.hSpeed ||
-      (http.arg("stopDiag") != "0" && http.arg("stopDiag") != "1")) {
-    http.send(400, "text/plain", "Start speed must not exceed either max speed; DIAG must be boolean."); return;
+      (formArg(form,"stopDiag") != "0" && formArg(form,"stopDiag") != "1")) {
+    settingsReply(id,400,"Start speed or DIAG value invalid."); return;
   }
-  if ((http.arg("limitHoming")!="0" && http.arg("limitHoming")!="1") || next.toolMax>next.vMax || next.homeBackoff>min(next.vMax,next.hMax)) {
-    http.send(400,"text/plain","Invalid homing mode, backoff, or tool envelope."); return;
+  if ((formArg(form,"limitHoming")!="0" && formArg(form,"limitHoming")!="1") || next.toolMax>next.vMax || next.homeBackoff>min(next.vMax,next.hMax)) {
+    settingsReply(id,400,"Invalid homing mode, backoff, or tool envelope."); return;
   }
-  next.limitHoming=http.arg("limitHoming")=="1";
-  next.stopDiag = http.arg("stopDiag") == "1";
+  next.limitHoming=formArg(form,"limitHoming")=="1";
+  next.stopDiag = formArg(form,"stopDiag") == "1";
   portENTER_CRITICAL(&mux); cfg = next; portEXIT_CRITICAL(&mux);
   for (int i=0;i<4;++i) {
     detachInterrupt(DIAG_PINS[i]);
@@ -526,9 +529,27 @@ void applySettings() {
   startupDriverRetry = false;
   portENTER_CRITICAL(&mux); fault = ok ? 0 : (pulseTimer ? 3 : 5); portEXIT_CRITICAL(&mux);
   ready = ok; owner = -1;
-  http.send(ok ? 200 : 503, "text/plain", ok ? "Applied to all selected drivers. Arm explicitly." : "Settings saved in RAM, but driver checks failed; outputs disabled.");
+  settingsReply(id,ok ? 200 : 503, ok ? "Applied to all selected drivers. Arm explicitly." : "Driver checks failed; outputs disabled.");
 }
-#include "network_setup.h"
+void serviceUsb() {
+  static String line;
+  while (Serial.available()) {
+    const char c = char(Serial.read());
+    if (c == '\n') {
+      if (line == "K") onLink(1,LINK_CONNECTED,"");
+      else if (line == "X") onLink(1,LINK_DISCONNECTED,"");
+      else if (line.startsWith("C:")) onLink(1,LINK_TEXT,line.substring(2));
+      else if (line.startsWith("S:")) {
+        const int split=line.indexOf(':',2); long id;
+        if (split>2 && parseNumber(line.substring(2,split),1,2147483647,id)) applySettings(line.substring(split+1),id);
+      }
+      line="";
+    } else if (c != '\r') {
+      if (line.length()<4096) line+=c;
+      else line="";
+    }
+  }
+}
 void setup() {
   digitalWrite(EN, HIGH); pinMode(EN, OUTPUT);
   for (int p : {25, 14, 32, 26, 33}) { digitalWrite(p, LOW); pinMode(p, OUTPUT); }
@@ -555,15 +576,10 @@ void setup() {
   if (esp_timer_create(&args, &pulseTimer) != ESP_OK || esp_timer_start_periodic(pulseTimer, 100) != ESP_OK) {
     pulseTimer = nullptr; ready = false; fault = 5;
   }
-  beginNetwork();
-  http.on("/", networkPage);
-  http.on("/wifi",HTTP_POST,saveNetwork);
-  http.on("/settings", HTTP_POST, applySettings);
-  http.begin(); ws.begin(); ws.onEvent(onSocket);
-  Serial.println("Press Brake protocol 2: 8x microsteps, 200 pulses/mm. Manual home and DIAG off by default. Serial p: settings.");
+  Serial.println("Press Brake USB protocol 2: 8x microsteps, 200 pulses/mm. Manual home and DIAG off by default.");
 }
 void loop() {
-  http.handleClient(); ws.loop(); serviceNetwork();
+  serviceUsb();
   if (startupDriverRetry && int32_t(millis() - nextStartupDriverRetry) >= 0) {
     portENTER_CRITICAL(&mux); const bool safeToRetry = !enabled && activeAxis < 0;
     portEXIT_CRITICAL(&mux);
@@ -581,23 +597,9 @@ void loop() {
       } else nextStartupDriverRetry = millis() + 1500;
     }
   }
-  static bool connected = false;
-  const bool online = !setupAP && WiFi.getMode() == WIFI_STA && WiFi.status() == WL_CONNECTED;
-  if (online && !connected) {
-    Serial.printf("Connected Wi-Fi: %s | Motion API: http://%s or http://cnc-press-brake.local; UI runs on your computer\n",
-      WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
-    if (MDNS.begin("cnc-press-brake")) MDNS.addService("http", "tcp", 80);
-  }
-  if (!online && connected) {
-    portENTER_CRITICAL(&mux); const bool wasArmed=enabled; portEXIT_CRITICAL(&mux);
-    if (wasArmed) latchFault(2);
-    owner = -1;
-  }
-  connected = online;
   portENTER_CRITICAL(&mux); const int a = activeAxis; const bool e = enabled; portEXIT_CRITICAL(&mux);
   if (a < 0 && runHoldAxis >= 0 && ready) setCurrentMode(-1);
   if (!e) owner = -1;
-  if (Serial.available() && Serial.read() == 'p') exportSettings();
   static uint32_t lastPoll = 0, lastStatus = 0;
   static int cursor = 0;
   if (millis() - lastPoll >= 100) {
@@ -607,6 +609,6 @@ void loop() {
       if (PRESENT[i]) { pollDriver(i); break; }
     }
   }
-  if (millis() - lastStatus >= 150) { lastStatus = millis(); sendTelemetry(); }
+  if (millis() - lastStatus >= 300) { lastStatus = millis(); sendTelemetry(); }
   delay(1);
 }

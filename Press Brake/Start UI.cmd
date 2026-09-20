@@ -6,7 +6,12 @@ if errorlevel 1 (
   pause
   exit /b 1
 )
-set "ESP_HOST=cnc-press-brake.local"
-set /p "ESP_HOST=ESP IP or hostname [cnc-press-brake.local]: "
-node server.cjs "%ESP_HOST%"
+if not exist node_modules\serialport (
+  echo Installing the local USB serial relay dependencies...
+  call npm install
+  if errorlevel 1 (pause & exit /b 1)
+)
+set "ESP_PORT="
+set /p "ESP_PORT=ESP COM port shown in Device Manager, for example COM5: "
+node usb-server.cjs "%ESP_PORT%"
 pause
