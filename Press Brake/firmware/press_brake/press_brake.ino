@@ -26,7 +26,7 @@ constexpr bool INVERT_H1 = false, INVERT_H2 = false;
 
 // Time allowed without a browser heartbeat while outputs are armed.
 // Increase this if brief Wi-Fi/browser delays cause watchdog faults.
-constexpr uint32_t BROWSER_WATCHDOG_MS = 2000;
+constexpr uint32_t BROWSER_WATCHDOG_MS = 8000;
 
 #include "wifi_secrets.h"
 constexpr int MICROSTEPS = 8;
@@ -69,11 +69,17 @@ bool setupAP = false;
 int activeAxis = -1, direction = 0, fault = 0;
 int32_t position[2] = {0, 0}, remaining = 0;
 bool zeroed[2] = {false, false};
-float velocity = 0;
+float velocity = 0, moveSpeedCap = 0;
 int64_t heartbeat = 0, prechargeUntil = 0, lastTick = 0, nextStep = 0, cruiseSince = 0;
 uint32_t diagEdges[4] = {};
 bool ready = false, seen[4] = {}, configured[4] = {};
+bool startupDriverRetry = false;
+uint8_t startupDriverAttempts = 0;
+uint32_t nextStartupDriverRetry = 0;
 uint32_t drv[4] = {}, gstat[4] = {}, sampleAt[4] = {};
+uint32_t configGconf[4] = {}, configChopconf[4] = {}, configPwmconf[4] = {};
+uint8_t ifcntBefore[4] = {}, ifcntAfter[4] = {};
+bool configMatch[4] = {};
 uint16_t sg[4] = {};
 int owner = -1, runHoldAxis = -1;
 const char *faultText[] = {"none", "DIAG stall", "browser watchdog/disconnect",
@@ -172,7 +178,7 @@ void motionTick(void *) {
   if (zeroed[a] && (nextPos<0 || nextPos>(a==0 ? min(cfg.vMax,cfg.toolMax) : cfg.hMax))) {
     haltLocked(false); portEXIT_CRITICAL(&mux); return;
   }
-  const float maxSpeed = a == 0 ? cfg.vSpeed : cfg.hSpeed;
+  const float maxSpeed = moveSpeedCap;
   const float accel = a == 0 ? cfg.vAccel : cfg.hAccel;
   const float dt = fminf((now - lastTick) / 1000000.0f, 0.002f);
   lastTick = now;
@@ -206,9 +212,11 @@ void motionTick(void *) {
 bool configurationMatches(int i) {
   auto &d = *drivers[i];
   const uint32_t gc = d.GCONF(), cc = d.CHOPCONF(), pc = d.PWMCONF();
-  return (gc & 0xCF) == (0xC0U | (INVERT[i] ? 8U : 0U)) &&
+  configGconf[i] = gc; configChopconf[i] = cc; configPwmconf[i] = pc;
+  configMatch[i] = (gc & 0xCF) == (0xC0U | (INVERT[i] ? 8U : 0U)) &&
     ((cc >> 24) & 15) == 5 && (cc & (1UL << 28)) &&
     (cc & 15) == 4 && (pc & (3UL << 18)) == (3UL << 18);
+  return configMatch[i];
 }
 bool configureDriver(int i) {
   auto &d = *drivers[i];
@@ -227,11 +235,19 @@ bool configureDriver(int i) {
   d.semin(0); d.SGTHRS(cfg.sgthrs);
   d.TCOOLTHRS(static_cast<uint32_t>(12000000.0f * MICROSTEPS / (256.0f * cfg.senseMin)));
   d.VACTUAL(0);
-  const bool acknowledged = static_cast<uint8_t>(d.IFCNT() - before) > 0;
+  ifcntBefore[i] = before;
+  ifcntAfter[i] = d.IFCNT();
+  const bool acknowledged = static_cast<uint8_t>(ifcntAfter[i] - before) > 0;
   drv[i] = d.DRV_STATUS(); gstat[i] = d.GSTAT(); sampleAt[i] = millis();
-  configured[i] = acknowledged && configurationMatches(i) &&
+  const bool registersMatch = configurationMatches(i);
+  configured[i] = acknowledged && registersMatch &&
     drv[i] != 0xFFFFFFFF && !(drv[i] & 0x3F) && !(gstat[i] & 6);
-  Serial.printf("%s UART %d: %s\n", NAMES[i], ADDRESS[i], configured[i] ? "CONFIG PASS" : "CONFIG FAIL");
+  Serial.printf("%s UART %d: %s | IFCNT %u->%u | GCONF 0x%08lX CHOPCONF 0x%08lX PWMCONF 0x%08lX | register match %d | DRV 0x%08lX GSTAT %lu\n",
+    NAMES[i], ADDRESS[i], configured[i] ? "CONFIG PASS" : "CONFIG FAIL",
+    ifcntBefore[i], ifcntAfter[i],
+    (unsigned long)configGconf[i], (unsigned long)configChopconf[i],
+    (unsigned long)configPwmconf[i], configMatch[i],
+    (unsigned long)drv[i], (unsigned long)gstat[i]);
   return configured[i];
 }
 bool configureAll() {
@@ -290,7 +306,7 @@ void notice(uint8_t client, const char *message) {
   if (requestId) { acknowledge(client,false,message); return; }
   String s = String("{\"notice\":\"") + message + "\"}"; ws.sendTXT(client, s);
 }
-void startMove(uint8_t client, int axis, long amount, bool absolute, bool isHome) {
+void startMove(uint8_t client, int axis, long amount, bool absolute, bool isHome, int speedLimit = 0) {
   portENTER_CRITICAL(&mux);
   const bool allowed = enabled && !fault && activeAxis < 0 && owner == client;
   const int32_t pos = position[axis];
@@ -328,6 +344,7 @@ void startMove(uint8_t client, int axis, long amount, bool absolute, bool isHome
     }
     remaining = static_cast<int32_t>(delta > 0 ? delta : -delta);
     digitalWrite(DIR_PINS[axis], direction > 0 ? HIGH : LOW);
+    moveSpeedCap = speedLimit ? speedLimit : (axis == 0 ? cfg.vSpeed : cfg.hSpeed);
     velocity = isHome ? cfg.homeSpeed : cfg.start; sensing = false; cruiseSince = 0;
     const int64_t now = esp_timer_get_time();
     prechargeUntil = now + cfg.precharge * 1000LL;
@@ -371,10 +388,17 @@ void sendTelemetry() {
       ",\"configured\":" + (configured[i] ? "true" : "false") +
       ",\"age\":" + (millis() - sampleAt[i]) + ",\"drv\":" + drv[i] +
       ",\"gstat\":" + gstat[i] + ",\"sg\":" + sg[i] +
+      ",\"configGconf\":" + configGconf[i] +
+      ",\"configChopconf\":" + configChopconf[i] +
+      ",\"configPwmconf\":" + configPwmconf[i] +
+      ",\"configMatch\":" + (configMatch[i] ? "true" : "false") +
+      ",\"ifcntBefore\":" + String(unsigned(ifcntBefore[i])) +
+      ",\"ifcntAfter\":" + String(unsigned(ifcntAfter[i])) +
       ",\"diag\":" + digitalRead(DIAG_PINS[i]) + ",\"edges\":" + edges[i] + "}";
   }
   s += "],\"protocol\":2,\"stepsPerMm\":"+String(STEPS_PER_MM)+",\"moveId\":"+move+",\"completedId\":"+done+",\"homing\":"+home;
   s += ",\"limits\":["+String(digitalRead(34))+","+String(digitalRead(35))+","+String(digitalRead(36))+"]";
+  s += ",\"wifiMode\":\""+String(setupAP ? "setup" : (WiFi.status()==WL_CONNECTED ? "station" : "connecting"))+"\"";
   s += ",\"settings\":"+settingsJSON()+"}"; ws.broadcastTXT(s);
 }
 void exportSettings() {
@@ -420,7 +444,7 @@ void onSocket(uint8_t client, WStype_t type, uint8_t *payload, size_t length) {
     if (!fault) { heartbeat = esp_timer_get_time(); enabled = true; digitalWrite(EN, LOW); }
     portEXIT_CRITICAL(&mux); return;
   }
-  // Wire protocol: zero:v | jog:v:+ | step:h:-100 | goto:v:250
+  // Wire protocol: zero:v | jog:v:+:100 | step:h:-100 | goto:v:250
   const int colon = m.indexOf(':');
   if (colon < 0) return;
   const String op = m.substring(0, colon);
@@ -439,8 +463,22 @@ void onSocket(uint8_t client, WStype_t type, uint8_t *payload, size_t length) {
   }
   if (tail.length() < 3 || tail[1] != ':') return;
   const String raw = tail.substring(2);
-  if (op == "jog" && (raw == "+" || raw == "-")) {
-    notice(client,"Use bounded held step commands instead of unlimited jog."); return;
+  if (op == "jog") {
+    const int split = raw.indexOf(':');
+    if (split != 1 || (raw[0] != '+' && raw[0] != '-')) { notice(client,"Jog requires direction and speed in pulses/s."); return; }
+    long speed;
+    const int stageMax = axis == 0 ? cfg.vSpeed : cfg.hSpeed;
+    if (!parseNumber(raw.substring(2),cfg.start,stageMax,speed)) { notice(client,"Jog speed is outside the configured stage range."); return; }
+    portENTER_CRITICAL(&mux);
+    const int32_t pos = position[axis]; const bool hasZero = zeroed[axis];
+    portEXIT_CRITICAL(&mux);
+    if (!hasZero) { notice(client,"Set this stage home before continuous jog."); return; }
+    const int32_t limit = axis == 0 ? min(cfg.vMax,cfg.toolMax) : cfg.hMax;
+    const long available = raw[0] == '+' ? limit - pos : pos;
+    if (available <= 0) { notice(client,"Jog is already at the travel boundary."); return; }
+    const long distance = available < cfg.maxTravel ? available : cfg.maxTravel;
+    startMove(client,axis,(raw[0] == '+' ? 1 : -1) * distance,false,false,int(speed));
+    return;
   }
   long value;
   if ((op == "step" || op == "goto") && parseNumber(raw, -POSITION_BOUND, POSITION_BOUND, value))
@@ -485,6 +523,7 @@ void applySettings() {
   }
   ready = false;
   const bool ok = configureAll() && pulseTimer;
+  startupDriverRetry = false;
   portENTER_CRITICAL(&mux); fault = ok ? 0 : (pulseTimer ? 3 : 5); portEXIT_CRITICAL(&mux);
   ready = ok; owner = -1;
   http.send(ok ? 200 : 503, "text/plain", ok ? "Applied to all selected drivers. Arm explicitly." : "Settings saved in RAM, but driver checks failed; outputs disabled.");
@@ -503,7 +542,13 @@ void setup() {
     }
   }
   ready = configureAll();
-  if (!ready) fault = 3;
+  if (!ready) {
+    fault = 3;
+    startupDriverRetry = true;
+    startupDriverAttempts = 1;
+    nextStartupDriverRetry = millis() + 1500;
+    Serial.println("Driver configuration incomplete at boot; retrying while outputs remain disabled.");
+  }
   esp_timer_create_args_t args = {};
   args.callback = motionTick; args.dispatch_method = ESP_TIMER_TASK; args.name = "stages";
   args.skip_unhandled_events = true;
@@ -519,13 +564,35 @@ void setup() {
 }
 void loop() {
   http.handleClient(); ws.loop(); serviceNetwork();
+  if (startupDriverRetry && int32_t(millis() - nextStartupDriverRetry) >= 0) {
+    portENTER_CRITICAL(&mux); const bool safeToRetry = !enabled && activeAxis < 0;
+    portEXIT_CRITICAL(&mux);
+    if (safeToRetry) {
+      ++startupDriverAttempts;
+      Serial.printf("Startup driver configuration retry %u/5\n", startupDriverAttempts);
+      const bool ok = configureAll();
+      if (ok && pulseTimer) {
+        portENTER_CRITICAL(&mux); if (fault == 3) fault = 0; portEXIT_CRITICAL(&mux);
+        ready = true; startupDriverRetry = false;
+        Serial.println("Driver configuration now ready; Arm is available.");
+      } else if (startupDriverAttempts >= 5) {
+        startupDriverRetry = false;
+        Serial.println("Driver startup retries exhausted. Inspect diagnostic registers; Apply settings can retry while disabled.");
+      } else nextStartupDriverRetry = millis() + 1500;
+    }
+  }
   static bool connected = false;
-  const bool online = WiFi.status() == WL_CONNECTED;
+  const bool online = !setupAP && WiFi.getMode() == WIFI_STA && WiFi.status() == WL_CONNECTED;
   if (online && !connected) {
-    Serial.printf("Motion API: http://%s or http://cnc-press-brake.local; UI runs on your computer\n", WiFi.localIP().toString().c_str());
+    Serial.printf("Connected Wi-Fi: %s | Motion API: http://%s or http://cnc-press-brake.local; UI runs on your computer\n",
+      WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
     if (MDNS.begin("cnc-press-brake")) MDNS.addService("http", "tcp", 80);
   }
-  if (!online && connected) { latchFault(2); owner = -1; }
+  if (!online && connected) {
+    portENTER_CRITICAL(&mux); const bool wasArmed=enabled; portEXIT_CRITICAL(&mux);
+    if (wasArmed) latchFault(2);
+    owner = -1;
+  }
   connected = online;
   portENTER_CRITICAL(&mux); const int a = activeAxis; const bool e = enabled; portEXIT_CRITICAL(&mux);
   if (a < 0 && runHoldAxis >= 0 && ready) setCurrentMode(-1);

@@ -7,6 +7,13 @@ int networkSlot=0;
 bool networkWasOnline=false;
 String setupToken;
 
+void reportNetworkEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+  if (event == ARDUINO_EVENT_WIFI_STA_CONNECTED) Serial.println("Wi-Fi associated with access point; awaiting IP.");
+  if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) Serial.println("Wi-Fi received an IP address.");
+  if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED)
+    Serial.printf("Wi-Fi station disconnected; reason code %u.\n", unsigned(info.wifi_sta_disconnected.reason));
+}
+
 void tryNetwork() {
   WiFi.disconnect();
   const char *ssid=networkSlot==0 ? WIFI_SSID : networkSlot==1 ? WIFI_SECOND_SSID : customSSID.c_str();
@@ -18,6 +25,7 @@ void beginNetwork() {
   networkPrefs.begin("brake-wifi",false);
   customSSID=networkPrefs.getString("ssid",""); customPassword=networkPrefs.getString("password","");
   WiFi.persistent(false); WiFi.setAutoReconnect(false);
+  WiFi.onEvent(reportNetworkEvent);
   WiFi.setHostname("cnc-press-brake"); WiFi.mode(WIFI_STA);
   tryNetwork();
 }
@@ -26,15 +34,20 @@ void serviceNetwork() {
   if (setupAP) return;
   if (WiFi.status()==WL_CONNECTED) { networkWasOnline=true; return; }
   if (networkWasOnline) {
-    networkWasOnline=false; latchFault(2); owner=-1; networkSlot=0; tryNetwork(); return;
+    networkWasOnline=false;
+    portENTER_CRITICAL(&mux); const bool wasArmed=enabled; portEXIT_CRITICAL(&mux);
+    if (wasArmed) latchFault(2);
+    owner=-1; networkSlot=0; tryNetwork(); return;
   }
-  if (millis()-networkAttemptAt<15000) return;
+  const uint32_t waitMs=networkSlot==0 ? 30000 : 20000;
+  if (millis()-networkAttemptAt<waitMs) return;
+  Serial.printf("Wi-Fi preference %d did not connect within %lu seconds.\n",networkSlot+1,(unsigned long)(waitMs/1000));
   ++networkSlot;
   if (networkSlot<2 || (networkSlot==2 && customSSID.length())) { tryNetwork(); return; }
   stopMotion(true); owner=-1; WiFi.disconnect(); WiFi.mode(WIFI_AP);
   setupAP=WiFi.softAP("PressBrake-Setup",SETUP_AP_PASSWORD);
   setupToken=String(esp_random(),HEX)+String(esp_random(),HEX);
-  if (setupAP) Serial.println("Wi-Fi setup: join PressBrake-Setup, then http://192.168.4.1. Motion disabled.");
+  if (setupAP) Serial.printf("Wi-Fi setup: join PressBrake-Setup, then http://%s. Motion disabled.\n",WiFi.softAPIP().toString().c_str());
   else { networkSlot=0; WiFi.mode(WIFI_STA); tryNetwork(); }
 }
 void networkPage() {

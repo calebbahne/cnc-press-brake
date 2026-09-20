@@ -2,7 +2,15 @@
 
 September 20, 2026. Local six-page control UI, protocol 2 ESP32 firmware, and a hardware-free simulator. The earlier `Testing Hardware` folder is preserved.
 
-**Status:** UI, planning, relay, keyboard handlers, and simulated protocol tested locally. Firmware has been reviewed but **not compiled, uploaded, or physically tested**. Arduino compilation was intentionally not attempted at Caleb's request. This checkpoint is ready for that hardware validation, not a claim that a bend has already been made.
+**Status:** UI, planning, relay, keyboard handlers, and simulated protocol tested locally. The user compiled and uploaded the first firmware checkpoint. Codex has not compiled or physically tested the updated firmware described below, at Caleb's request. Controller connection and driver configuration were checked live without commanding motor motion. No bend has been physically verified.
+
+### September 20 live connection follow-up
+
+The first hardware upload compiled and the ESP was reachable at `10.0.0.132`. The UI showed **UART/configuration lost** and all four drivers as **UART seen / configuration failed**; this is why Arm was disabled. Reapplying the unchanged settings while outputs were disabled succeeded: all four drivers became READY and Arm became available. No remote arming or motion was performed.
+
+The current source now retries driver setup up to five times after an initial failure, while outputs remain disabled. It also prints IFCNT and driver register checks at startup, and shows the fault reason in the right panel. Upload the updated sketch to use these changes. Until then, if the same startup fault appears, open Settings and select **Apply settings / clear fault** while disabled. Only Arm after all installed drivers show READY.
+
+The later connection update addresses the reported **browser watchdog/disconnect** fault: the UI no longer stops heartbeats because a single status update is late, and firmware allows an 8-second heartbeat gap. Refresh the PC page for the UI fix and upload the latest sketch for the 8-second watchdog and held-jog protocol. If a watchdog fault is already latched, keep outputs disabled, use **Settings → Apply settings / clear fault** after connection stabilizes, then Arm and establish homes again. A continuously closing WebSocket or a Wi-Fi disconnect still stops the machine and requires investigating the link; increasing the timeout does not make an absent connection safe to use.
 
 ## Open the preview
 
@@ -47,13 +55,14 @@ Changing width or desired angle does **not** calculate a new depth. Calibrate an
 | Clamp / bend | Hold **Shift + Down arrow**. |
 | Retract | Hold **Shift + Up arrow**. |
 | Manual increment / absolute move | Prepare, then hold the indicated gesture. The on-screen Hold button supports upward Y and X moves; downward Y requires A + L. |
+| Manual Mode held jog | Set Y/X jog speed, then hold **Shift + U** (up), **Shift + D** (down), **Shift + F** (gauge toward die), or **Shift + B** (gauge back). Home that axis first; release either key to stop. |
 | Phase change | Release all motion keys; hold a fresh gesture for the next phase. |
 | Release during motion | Stop and cancel the prepared sequence. Re-prepare to continue. |
 | Stop | Escape anywhere, Space outside editable fields, or persistent Stop button. Retains hold current. |
 | Disable | Removes driver enable and clears both home references. |
 | Lost focus / hidden tab | Stops, requests disable, clears key states. No automatic resume. |
 
-The controller requires a continuing **motion hold lease (350 ms)** in addition to its **connection heartbeat (2 seconds, inherited from the current test sketch)**. A browser freeze cannot keep a finite move running indefinitely merely because a connection exists. Watchdog/fault disable clears homes. An ordinary keyboard remains an operator control, not a safety-rated two-hand switch or hardware emergency stop.
+The controller requires a continuing **motion hold lease (350 ms)** in addition to its **connection heartbeat (8 seconds in this update)**. The browser now sends the heartbeat while armed even when a status packet is briefly delayed; an active move still stops after 1.5 seconds without telemetry, or within 350 ms without the separate motion hold. Held jogs are bounded by the homed travel envelope, installed tooling depth and maximum move budget. A browser freeze cannot keep a move running indefinitely merely because a connection exists. Watchdog/fault disable clears homes. An ordinary keyboard remains an operator control, not a safety-rated two-hand switch or hardware emergency stop.
 
 Automatic clamp-to-bend, pedal double-tap, unattended repeats, multi-bend sequencing and automatic retract after a released gesture are intentionally not enabled in this checkpoint. Every stroke phase requires a deliberate hold; both stage pairs move sequentially.
 
@@ -79,7 +88,9 @@ Automatic clamp-to-bend, pedal double-tap, unattended repeats, multi-bend sequen
 
 ## Wi-Fi fallback
 
-Boot tries the existing preferred network, then **iPhone (8)**, then a custom saved network, allowing 15 seconds per candidate. The iPhone password supplied in chat is installed in the ignored local secrets header.
+Boot tries the existing preferred network, then **iPhone (8)**, then a custom saved network. The preferred network now has a 30-second connection window; the two fallbacks have 20 seconds each. The iPhone password supplied in chat is installed in the ignored local secrets header.
+
+`Trying Wi-Fi preference 2` means the first connection did not finish within its window on that boot. The revised serial output reports which SSID eventually connected. The earlier serial sequence included a setup-AP announcement followed by a `10.0.0.132` station address. The ESP was subsequently reachable at that address; those messages do not by themselves identify which SSID was connected. A fallback setup network will not be visible when the ESP has connected normally on a later boot.
 
 If none connect, the ESP creates **PressBrake-Setup**. Its local setup password is in `wifi_secrets.h` (`SETUP_AP_PASSWORD`). Connect your computer/phone to it and browse **http://192.168.4.1**. Enter the new SSID/password, save, and the ESP restarts. The custom network persists in ESP NVS as the third preference. Motion is disabled in setup mode. This is an explicit setup page, not an automatically opening captive portal.
 
