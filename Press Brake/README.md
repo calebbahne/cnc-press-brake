@@ -2,7 +2,7 @@
 
 The hardware UI now uses the ESP32 programming USB cable. The computer still serves the same browser pages at `http://127.0.0.1:8080`; `usb-server.cjs` relays commands, telemetry, and settings through the ESP COM port. The TMC2209 UART on GPIO16/17 is unchanged. Wi-Fi is absent from the active firmware. `server.cjs` remains for the hardware-free simulator and older relay tests.
 
-**Manual commissioning motion:** Manual Mode increments, absolute targets after home, manual strokes, and held jogs no longer use an assumed 0-to-end machine/tool coordinate envelope. Held jog works before home. A manual absolute target still requires home so its coordinates have meaning. Run bend programs still require the calibrated travel and tooling limits. Manual commands retain a finite per-command budget, connection and motion-hold deadlines, Stop, driver faults, and configured physical limit-switch behavior. Check the physical direction and clearances with a 0.1 mm increment before using longer moves.
+**Manual commissioning motion:** Manual Mode has one shared speed/distance control and two axis panels. Hold Shift+U/D for the punch and Shift+F/B for the backgauge. It works before home, retains a finite per-command budget, and stops when either key is released. Y is zero at the upper punch reference and negative downward; X is positive toward the die.
 
 **This USB build has not yet been compiled, uploaded, or tested against the machine.** Keep the motor outputs unloaded/disabled for the first link test. The PC relay needs Node dependencies (`npm install` in this folder; the launcher installs them if missing). Close Arduino Serial Monitor before launching the UI because it and the relay use the same COM port. Close the UI window before the next upload.
 
@@ -32,10 +32,10 @@ The example depths are arbitrary simulation values, not usable hardware calibrat
 ## Upload and connect to hardware
 
 1. In Arduino IDE, open [firmware/press_brake/press_brake.ino](firmware/press_brake/press_brake.ino). Use DOIT ESP32 DEVKIT V1 and TMCStepper. The active sketch does not need the WebSockets library, Wi-Fi headers, or `wifi_secrets.h`.
-2. Confirm all four driver-present flags match physically installed drivers. Existing inversion flags were retained; positive logical motion is labeled Y down and X toward the die. Verify with a small unloaded jog before homing. If a pair moves in the wrong direction, correct the corresponding firmware inversion configuration before proceeding.
+2. Confirm all four driver-present flags match physically installed drivers. Y is negative down and X is positive toward the die. Verify with a small unloaded distance jog before homing. If a pair moves in the wrong direction, correct the corresponding firmware inversion configuration before proceeding.
 3. Compile/upload in Arduino IDE. If inspecting boot diagnostics in Serial Monitor, use **115200 baud**, then close Serial Monitor. No Arduino toolchain was available for this checkpoint.
 4. Find the ESP COM port in Windows Device Manager. Close the preview server if it uses port 8080. Double-click **Start UI.cmd**, enter that COM port (for example `COM5`), and open **http://127.0.0.1:8080**. Keep the launcher window open. It prints ESP diagnostics and retries a temporarily unavailable port.
-5. The UI refuses older firmware: it requires protocol 2 and 200 pulses/mm. No SIMULATION banner should appear when connected to the ESP.
+5. The UI refuses older firmware: it requires protocol 3 and reports the steps/mm derived from the applied microstep setting. No SIMULATION banner should appear when connected to the ESP.
 
 ## First real session: manual home, no DIAG wires
 
@@ -55,12 +55,12 @@ Changing width or desired angle does **not** calculate a new depth. Calibrate an
 
 | Action | Input / behavior |
 |---|---|
-| Prepare | Click a move or Prepare Single Bend. No movement starts yet. |
-| Gauge positioning / punch approach | Hold **A + L**. |
-| Clamp / bend | Hold **Shift + Down arrow**. |
-| Retract | Hold **Shift + Up arrow**. |
-| Manual increment / absolute move | Prepare, then hold the indicated gesture. The on-screen Hold button supports upward Y and X moves; downward Y requires A + L. |
-| Manual Mode held jog | Set Y/X jog speed, then hold **Shift + U** (up), **Shift + D** (down), **Shift + F** (gauge toward die), or **Shift + B** (gauge back). Home that axis first; release either key to stop. |
+| Prepare | Click Prepare Single Bend. No movement starts yet. |
+| Punch up / retract | Hold **Shift + U**. |
+| Punch down / clamp / bend | Hold **Shift + D**. |
+| Backgauge toward die | Hold **Shift + F**. |
+| Backgauge away from die | Hold **Shift + B**. |
+| Manual Mode | Choose continuous speed or distance per hold, choose mm or steps, then hold the matching Shift shortcut. Release either key to stop. |
 | Phase change | Release all motion keys; hold a fresh gesture for the next phase. |
 | Release during motion | Stop and cancel the prepared sequence. Re-prepare to continue. |
 | Stop | Escape anywhere, Space outside editable fields, or persistent Stop button. Retains hold current. |
@@ -75,17 +75,17 @@ Automatic clamp-to-bend, pedal double-tap, unattended repeats, multi-bend sequen
 
 - Wire NC switches per [electrical quick reference](../electrical-quick-reference.md): Y1 GPIO34, Y2 GPIO35, X GPIO36, external pull-ups. LOW is closed; HIGH is triggered or an open wire. The inputs lack internal pull-ups.
 - Disable outputs, check the wiring, enable switch homing in Settings, and Apply. Check all three displayed inputs change independently before commanding home.
-- **Prepare switch home** on each axis, then hold A + L. Both home directions are logical negative: Y up, X away from the die. Both vertical drivers must be installed. A switch already high blocks starting home; check wiring and, when appropriate, jog away first.
+- Enable Y and X switch homing independently in Settings. With only the two punch switches installed, enable **Y switch homing** and leave **X switch homing** off. Prepare Y home and hold **Shift + U**; X remains available for manual home.
 - Y seeks each switch independently, stopping that side's steps while the other approaches. X uses its shared STEP and one home switch; independent X squaring is unavailable.
 - Homing has a speed, total seek budget, 120-second ceiling, maximum Y squaring correction (default 1 mm), and backoff (default 1 mm). Excess correction, an unstable/open input, failure to reach a switch, or failure to release after backoff faults rather than declaring home.
-- Home zero is the switch trip location. On successful backoff, the displayed position is the positive backoff distance, not zero. During initial seek, unhomed coordinate readouts are not independent measurements of the two ram ends.
+- Home zero is the switch trip location. On successful Y backoff, the displayed position is negative because the punch moved downward from the upper zero. During initial seek, unhomed coordinate readouts are not independent measurements of the two ram ends.
 - These are home switches, not switches at both travel ends. Motion toward a triggered home input is stopped when switch homing is enabled. Manual commissioning motion otherwise has no software endpoint; programmed bends retain their configured bounds.
 - Until wiring and direction are physically verified, keep switch homing off. The implementation needs hardware commissioning; simulation does not validate switch polarity, debounce, squaring or mechanics.
 
 ## Calibration and limits
 
-- Current source uses **8× microsteps** with interpolation: 200 motor full steps/revolution × 8 / 8 mm lead = **200 STEP pulses/mm**, or 0.005 mm commanded resolution. This is not measured accuracy.
-- The original copied source set 8× microsteps but checked the full-step register setting. The new source checks the 8× register value and interpolation state consistently, and scales the StallGuard speed threshold accordingly.
+- Microstepping is selectable in Settings from 1× through 256×. Steps/mm is `25 × microsteps`; the default 8× setting is 200 steps/mm or 0.005 mm commanded resolution. Applying a change reconfigures all selected TMC2209 drivers and clears homes. Pulse based speed, acceleration, travel and backoff values may need adjustment.
+- Driver checks compare the configured microstep register value and interpolation state, and the StallGuard speed threshold scales with the selected microstepping.
 - Documented physical travel gives upper bounds of Y **25 mm / 5000 pulses** and X **48 mm / 9600 pulses**. Reduce these to the actual usable machine travel from the chosen home; firmware rejects settings above these maxima.
 - The installed tool maximum restricts programmed bends. Manual commissioning motion ignores that assumed envelope, including motion to a negative position relative to declared home. Use small increments until the actual travel and clearances are measured.
 - All four drivers share EN. Y normally steps both selected vertical drivers; independent Y stepping is used only during switch homing. X always shares pulses.

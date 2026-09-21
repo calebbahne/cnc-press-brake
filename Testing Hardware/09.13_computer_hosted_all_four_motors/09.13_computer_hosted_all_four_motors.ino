@@ -161,7 +161,7 @@ bool configureDriver(int i) {
   d.rms_current(cfg.current, cfg.hold / 100.0f);
   d.iholddelay(8); d.TPOWERDOWN(20);
   d.toff(4); d.blank_time(24);
-  d.microsteps(0); d.intpol(false); d.dedge(false);
+  d.microsteps(8); d.intpol(true); d.dedge(false); // d.microsteps(0); d.intpol(false); d.dedge(false); no microstepping
   d.en_spreadCycle(false); d.TPWMTHRS(0);
   d.pwm_autoscale(true); d.pwm_autograd(true);
   d.semin(0); d.SGTHRS(cfg.sgthrs);

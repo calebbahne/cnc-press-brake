@@ -3,9 +3,9 @@
 ## Controller
 
 - **ESP32:** common 30-pin ESP32 DevKit V1 / ESP-WROOM-32 development board.
-- **Board power:** regulated 5 V into `VIN`/`5V`; never feed 5 V into `3V3`.
+- **Board power:** use one verified supply path for the ESP32 board. The earlier build used regulated 5 V into `VIN`/`5V`; USB can also power the board. Do not connect both 5 V sources until the exact board's power-path schematic confirms that this is safe. Never feed 5 V into `3V3`.
 - **Logic level:** all ESP32 I/O is 3.3 V. ESP32, TMC logic, and 24 V power supply grounds must share a common ground.
-- **Network/UI:** Wi-Fi uses no external GPIO. The intended UI link is a WebSocket over the local network; motion pulses are generated locally on the ESP32.
+- **UI link:** The PC-hosted browser UI talks through the ESP32 programming USB cable (UART0/GPIO1 and GPIO3) via the local Node relay. The TMC driver UART remains on GPIO16/17. Motion pulses are generated locally on the ESP32. Close Arduino Serial Monitor before starting the UI relay; both use the same COM port.
 
 ## Motion hardware
 
