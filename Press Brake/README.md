@@ -6,7 +6,7 @@ The hardware UI now uses the ESP32 programming USB cable. The computer still ser
 
 **This USB build has not yet been compiled, uploaded, or tested against the machine.** Keep the motor outputs unloaded/disabled for the first link test. The PC relay needs Node dependencies (`npm install` in this folder; the launcher installs them if missing). Close Arduino Serial Monitor before launching the UI because it and the relay use the same COM port. Close the UI window before the next upload.
 
-September 20, 2026. Local six-page control UI, protocol 4 ESP32 firmware, and a hardware-free simulator. The earlier `Testing Hardware` folder is preserved.
+September 20, 2026. Local six-page control UI, protocol 5 ESP32 firmware, and a hardware-free simulator. The earlier `Testing Hardware` folder is preserved.
 
 **Earlier checkpoint status:** The user compiled and uploaded the first Wi-Fi firmware checkpoint. Controller connection and driver configuration were checked live without commanding motor motion. The new USB firmware has not been compiled or physically tested. No bend has been physically verified.
 
@@ -25,7 +25,7 @@ The earlier connection update kept heartbeats going through a briefly delayed st
 3. Settings → Load simulation example.
 4. Review the saved demo punch, die, material, and calculated bend positions.
 5. Arm motors. Manual Mode → Set current spot as home; Back Gauge → Set current spot as home.
-6. Run → Start guided bend. Follow the overlay through offset, gauge, clamp, form, clamp return, and return to the −2 mm start.
+6. Run → Start guided bend. Follow the overlay through offset, gauge, clamp, form, clamp return, and return to the −5 mm start.
 
 The example depths are arbitrary simulation values, not usable hardware calibration. Simulator libraries and controller profiles use separate browser storage keys from real-machine data. Closing the preview server stops the simulation. You can also run `node server.cjs --simulate 8088` for a separate preview port.
 
@@ -35,7 +35,7 @@ The example depths are arbitrary simulation values, not usable hardware calibrat
 2. Confirm all four driver-present flags match physically installed drivers. Y is negative down and X is positive toward the die. Verify with a small unloaded distance jog before homing. If a pair moves in the wrong direction, correct the corresponding firmware inversion configuration before proceeding.
 3. Compile/upload in Arduino IDE. If inspecting boot diagnostics in Serial Monitor, use **115200 baud**, then close Serial Monitor. No Arduino toolchain was available for this checkpoint.
 4. Find the ESP COM port in Windows Device Manager. Close the preview server if it uses port 8080. Double-click **Start UI.cmd**, enter that COM port (for example `COM5`), and open **http://127.0.0.1:8080**. Keep the launcher window open. It prints ESP diagnostics and retries a temporarily unavailable port.
-5. The UI refuses older firmware: it requires protocol 4 and reports the steps/mm derived from the applied microstep setting. No SIMULATION banner should appear when connected to the ESP.
+5. The UI refuses older firmware: it requires protocol 5 and reports the steps/mm derived from the applied microstep setting. No SIMULATION banner should appear when connected to the ESP.
 
 ## First real session: manual home, no DIAG wires
 
@@ -46,8 +46,8 @@ The example depths are arbitrary simulation values, not usable hardware calibrat
 5. Arm. Before home, Manual Mode and Back Gauge permit held setup increments up to **1 mm per command** and held keyboard jog. Start with **0.1 mm** increments to check direction. These unhomed commissioning moves cannot enforce an unknown absolute endpoint.
 6. Position Y at your repeatable retracted reference and X at your repeatable retracted gauge reference. Stop and use **Set current spot as home** on each page. Position is counted from these references; no encoders are planned.
 7. In Manual Mode, approach a scrap coupon in small increments. Record the clearance position, initial contact/clamp position, and a tested bend depth. A reported clamp position does not prove grip or force. Measure the resulting angle and adjust the depth using test pieces.
-8. Create Bend: enter width, desired included angle, taught bottom position, optional X position, and calibration notes. Offset and clamp come from the saved 74 mm punch-to-table reference and selected tool heights.
-9. Run → Start guided bend. It validates the setup, optional tooling cap, command distances, homes, and −2 mm starting position before enabling the first gesture.
+8. Create Bend: enter width, desired included angle, taught bottom position, optional X position, and calibration notes. Offset and clamp can come from the saved 74 mm punch-to-table reference and selected tool heights, or from the manual-position toggle and fields.
+9. Run → Start guided bend. It validates the setup, optional tooling cap, command distances, and homes before enabling the first gesture. Geometry and travel warnings can proceed only after the operator checks the acknowledgement box.
 
 Changing width or desired angle does **not** calculate a new depth. Calibrate and save separate recipes as needed. A future model can build on these measurements. No force/tonnage estimate is presented as measured load.
 
@@ -62,6 +62,8 @@ Changing width or desired angle does **not** calculate a new depth. Calibrate an
 | Backgauge toward die | Hold **Shift + F**. |
 | Backgauge away from die | Hold **Shift + B**. |
 | Manual Mode | Choose continuous speed or distance per hold, choose mm or steps, then hold the matching Shift shortcut. Release either key to stop. |
+| Absolute manual move | Choose absolute position and units, enter the target, prepare the desired axis, then hold the prompted Shift shortcut. |
+| Switch home | Prepare the axis and hold **A + L** through the full cycle. Motion stops after backoff; release both keys before moving again. |
 | Phase change | Release all motion keys; hold a fresh gesture for the next phase. |
 | Release during motion | Stop and cancel the prepared sequence. Re-prepare to continue. |
 | Stop | Escape anywhere, Space outside editable fields, or persistent Stop button. Retains hold current. |
@@ -76,9 +78,9 @@ Pedal double-tap, unattended repeats, and multi-bend sequencing are not enabled.
 
 - Wire NC switches per [electrical quick reference](../electrical-quick-reference.md): Y1 GPIO34, Y2 GPIO35, X GPIO36, external pull-ups. LOW is closed; HIGH is triggered or an open wire. The inputs lack internal pull-ups.
 - Disable outputs, check the wiring, enable switch homing in Settings, and Apply. Check all three displayed inputs change independently before commanding home.
-- Enable Y and X switch homing independently in Settings. With only the two punch switches installed, enable **Y switch homing** and leave **X switch homing** off. Prepare Y home and hold **Shift + U**; X remains available for manual home.
-- Y first moves both sides up until either switch contacts, backs both sides off, then approaches slowly while stopping each side independently. More than 1.5 mm of correction faults and stops the home cycle. X uses its shared STEP and one home switch; independent X squaring is unavailable.
-- Home zero is the final switch contact location. Successful Y homing then moves both sides down 2 mm together and reports −2 mm, the required bend starting position.
+- Enable Y and X switch homing independently in Settings. With only the two punch switches installed, enable **Y switch homing** and leave **X switch homing** off. Prepare Y home and hold **A + L**; X remains available for manual home.
+- Y first moves both sides up until either switch contacts, backs both sides off, then approaches slowly while stopping each side independently. More than 2.5 mm of correction faults and stops the home cycle. X uses its shared STEP and one home switch; independent X squaring is unavailable.
+- Home zero is the final switch contact location. Successful Y homing then moves both sides down 5 mm together and reports −5 mm, the normal bend starting position. The UI shows the commanded position and current homing stage during the cycle.
 - These are home switches, not switches at both travel ends. Motion toward a triggered home input is stopped when switch homing is enabled. Manual commissioning motion otherwise has no software endpoint; programmed bends retain their configured bounds.
 - Until wiring and direction are physically verified, keep switch homing off. The implementation needs hardware commissioning; simulation does not validate switch polarity, debounce, squaring or mechanics.
 
@@ -114,6 +116,6 @@ Run from this folder:
 node --test usb-server.test.cjs server.test.cjs model.test.cjs simulator.test.cjs controls.test.cjs
 ```
 
-39 tests cover recipe validation, derived guided positions, programmed bounds, manual commissioning motion, acknowledgement/completion, keyboard holds/release/focus, simulated homing and sequential moves, hold expiry, USB relay and disconnect, network preview relay, and isolation of preview storage. The simulator models protocol behavior; it does not execute or certify the ESP firmware.
+45 tests cover recipe validation, calculated and manual guided positions, acknowledged overrides, absolute and held manual motion, command completion, keyboard holds/release/focus, simulated homing and sequential moves, hold expiry, USB relay and disconnect, network preview relay, and isolation of preview storage. The simulator models protocol behavior; it does not execute or certify the ESP firmware.
 
 Next checkpoint requires Arduino IDE upload and unloaded physical checks: USB connection and reconnect, settings apply, correct directions and 1 mm travel calibration, manual homes, tool/machine bound rejection, release/Stop/focus-loss behavior, then a scrap-material bend. Do not treat this checkpoint as a validated automatic bend-angle controller.

@@ -76,7 +76,7 @@ bool configMatch[4] = {};
 uint16_t sg[4] = {};
 int owner = -1, runHoldAxis = -1;
 const char *faultText[] = {"none", "DIAG stall", "USB/browser watchdog/disconnect",
-  "UART/configuration lost", "driver temperature/short/undervoltage", "timer unavailable", "limit input triggered", "homing failed", "motion hold expired", "Y homing skew exceeds 1.5 mm"};
+  "UART/configuration lost", "driver temperature/short/undervoltage", "timer unavailable", "limit input triggered", "homing failed", "motion hold expired", "Y homing skew exceeds 2.5 mm"};
 
 void stepsLow() {
   digitalWrite(25, LOW); digitalWrite(14, LOW); digitalWrite(32, LOW);
@@ -129,7 +129,7 @@ void homeTickLocked(int64_t now) {
     if (++homePulses > cfg.maxTravel) { fault=7; haltLocked(false); return; }
     if (a==0) { digitalWrite(25,HIGH); digitalWrite(14,HIGH); }
     else digitalWrite(32,HIGH);
-    delayMicroseconds(3); stepsLow();
+    delayMicroseconds(3); stepsLow(); position[a]+=direction;
   } else if (homing == 2) {
     if (a==0) { digitalWrite(25,HIGH); digitalWrite(14,HIGH); }
     else digitalWrite(32,HIGH);
@@ -147,7 +147,7 @@ void homeTickLocked(int64_t now) {
       if (!homeContactAt) homeContactAt=now;
       if (now-homeContactAt<20000) { nextStep=now+1000; return; }
       position[a]=0; homeContactAt=0; direction=a==0?-1:1;
-      remaining=a==0?2*stepsPerMm():cfg.homeBackoff; homing=4;
+      remaining=a==0?5*stepsPerMm():cfg.homeBackoff; homing=4;
       digitalWrite(DIR_PINS[a],pinDirection(a,direction)); nextStep=now+5000; return;
     }
     homeContactAt=0;
@@ -155,11 +155,11 @@ void homeTickLocked(int64_t now) {
     if (a==0) {
       if (!homeHit[0]) digitalWrite(25,HIGH);
       if (!homeHit[1]) digitalWrite(14,HIGH);
-      if ((homeHit[0] != homeHit[1]) && ++skewPulses > int(ceilf(1.5f*stepsPerMm()))) {
+      if ((homeHit[0] != homeHit[1]) && ++skewPulses > int(ceilf(2.5f*stepsPerMm()))) {
         fault=9; haltLocked(false); return;
       }
     } else digitalWrite(32,HIGH);
-    delayMicroseconds(3); stepsLow();
+    delayMicroseconds(3); stepsLow(); position[a]+=direction;
   } else {
     if (a==0) { digitalWrite(25,HIGH); digitalWrite(14,HIGH); }
     else digitalWrite(32,HIGH);
@@ -330,7 +330,7 @@ void notice(uint8_t client, const char *message) {
   if (requestId) { acknowledge(client,false,message); return; }
   String s = String("{\"notice\":\"") + message + "\"}"; Serial.print('@'); Serial.println(s);
 }
-void startMove(uint8_t client, int axis, long amount, bool absolute, bool isHome, int speedLimit = 0, bool manualFree = false) {
+void startMove(uint8_t client, int axis, long amount, bool absolute, bool isHome, int speedLimit = 0, bool manualFree = false, bool bypassLimits = false) {
   portENTER_CRITICAL(&mux);
   const bool allowed = enabled && !fault && activeAxis < 0 && owner == client;
   const int32_t pos = position[axis];
@@ -345,11 +345,11 @@ void startMove(uint8_t client, int axis, long amount, bool absolute, bool isHome
   if (absolute && !hasZero) { notice(client, "Set this stage zero first."); return; }
   const int64_t delta = absolute ? int64_t(amount) - pos : amount;
   const int64_t target = int64_t(pos) + delta;
-  if (delta > cfg.maxTravel || delta < -cfg.maxTravel || target > POSITION_BOUND || target < -POSITION_BOUND) {
+  if ((!bypassLimits && (delta > cfg.maxTravel || delta < -cfg.maxTravel)) || target > POSITION_BOUND || target < -POSITION_BOUND) {
     notice(client, "Move exceeds the per-command step budget or position range."); return;
   }
   if (!isHome && !manualFree && !hasZero && (absolute || abs(amount)>stepsPerMm())) { notice(client,"Unhomed: use held setup increments of at most 1 mm, then set home."); return; }
-  if (!isHome && !manualFree && hasZero && axis==0 && cfg.toolMax>0 && target < -cfg.toolMax) {
+  if (!bypassLimits && !isHome && !manualFree && hasZero && axis==0 && cfg.toolMax>0 && target < -cfg.toolMax) {
     notice(client,"Target exceeds the installed tooling depth limit."); return;
   }
   if (!delta && !isHome) {
@@ -509,8 +509,8 @@ void onLink(uint8_t client, int type, const String &input) {
     return;
   }
   long value;
-  if ((op == "step" || op == "goto" || op == "manual") && parseNumber(raw, -POSITION_BOUND, POSITION_BOUND, value))
-    startMove(client, axis, value, op == "goto", false, 0, op == "manual");
+  if ((op == "step" || op == "goto" || op == "forcegoto" || op == "manual") && parseNumber(raw, -POSITION_BOUND, POSITION_BOUND, value))
+    startMove(client, axis, value, op == "goto" || op == "forcegoto", false, 0, op == "manual", op == "forcegoto");
   else notice(client, "Invalid command or integer step value.");
 }
 String formArg(const String &form, const char *key) {
@@ -622,7 +622,7 @@ void setup() {
   if (esp_timer_create(&args, &pulseTimer) != ESP_OK || esp_timer_start_periodic(pulseTimer, 100) != ESP_OK) {
     pulseTimer = nullptr; ready = false; fault = 5;
   }
-  Serial.printf("Press Brake USB protocol 4: %dx microsteps, %d steps/mm. Axis-specific switch homing and DIAG off by default.\n", cfg.microsteps, stepsPerMm());
+  Serial.printf("Press Brake USB protocol 5: %dx microsteps, %d steps/mm. Axis-specific switch homing and DIAG off by default.\n", cfg.microsteps, stepsPerMm());
 }
 void loop() {
   serviceUsb();
