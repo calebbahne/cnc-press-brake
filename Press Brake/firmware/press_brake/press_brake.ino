@@ -1,5 +1,5 @@
 /* Four-motor commissioning test. See README.md and electrical-quick-reference.md.
-   Protocol 4 checkpoint. Positions count STEP pulses from a manual/switch home.
+   Protocol 5 checkpoint. Positions count STEP pulses from a manual/switch home.
    Global EN energizes all physically connected drivers; support vertical loads.
 */
 #include <Arduino.h>
@@ -338,7 +338,7 @@ void startMove(uint8_t client, int axis, long amount, bool absolute, bool isHome
   portEXIT_CRITICAL(&mux);
   if (!allowed) { notice(client, "Arm first; stop the current stage before another move."); return; }
   if (!PRESENT[axis * 2] || !PRESENT[axis * 2 + 1]) { notice(client, "Both drivers must be selected for a coupled stage."); return; }
-  if (!requestId) { notice(client,"Protocol 4 requires an identified held move."); return; }
+  if (!requestId) { notice(client,"Protocol 5 requires an identified held move."); return; }
   if (isHome) {
     if (!switchHomingEnabled(axis) || !PRESENT[axis*2] || !PRESENT[axis*2+1]) { notice(client,"Switch homing is not enabled for this axis or both stage drivers are unavailable."); return; }
   }
@@ -421,7 +421,7 @@ void sendTelemetry() {
       ",\"ifcntAfter\":" + String(unsigned(ifcntAfter[i])) +
       ",\"diag\":" + digitalRead(DIAG_PINS[i]) + ",\"edges\":" + edges[i] + "}";
   }
-  s += "],\"protocol\":4,\"stepsPerMm\":"+String(stepsPerMm())+",\"moveId\":"+move+",\"completedId\":"+done+",\"homing\":"+home;
+  s += "],\"protocol\":5,\"stepsPerMm\":"+String(stepsPerMm())+",\"moveId\":"+move+",\"completedId\":"+done+",\"homing\":"+home;
   s += ",\"limits\":["+String(cfg.vLimitHoming?digitalRead(34):-1)+","+String(cfg.vLimitHoming?digitalRead(35):-1)+","+String(cfg.hLimitHoming?digitalRead(36):-1)+"]";
   s += ",\"transport\":\"usb\"";
   s += ",\"settings\":"+settingsJSON()+"}"; Serial.print('@'); Serial.println(s);
@@ -438,7 +438,7 @@ void onLink(uint8_t client, int type, const String &input) {
   if (type == LINK_CONNECTED) {
     // A new browser session must never inherit an armed session after a quick USB reconnect.
     if (owner == client) { latchFault(2); owner = -1; }
-    String s = String("{\"type\":\"hello\",\"id\":") + client + ",\"protocol\":4,\"stepsPerMm\":"+String(stepsPerMm())+",\"settings\":" + settingsJSON() + "}";
+    String s = String("{\"type\":\"hello\",\"id\":") + client + ",\"protocol\":5,\"stepsPerMm\":"+String(stepsPerMm())+",\"settings\":" + settingsJSON() + "}";
     Serial.print('@'); Serial.println(s); return;
   }
   if (type != LINK_TEXT || input.length() > 96) return;
