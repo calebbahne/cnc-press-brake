@@ -1,5 +1,5 @@
 /* Four-motor commissioning test. See README.md and electrical-quick-reference.md.
-   Protocol 3 checkpoint. Positions count STEP pulses from a manual/switch home.
+   Protocol 4 checkpoint. Positions count STEP pulses from a manual/switch home.
    Global EN energizes all physically connected drivers; support vertical loads.
 */
 #include <Arduino.h>
@@ -35,13 +35,13 @@ const char *NAMES[4] = {"Vertical 1", "Vertical 2", "Horizontal 1", "Horizontal 
 constexpr int32_t POSITION_BOUND = 1000000000;
 
 struct Settings {
-  int microsteps = 8;
+  int microsteps = 4;
   int current = 600, hold = 50, precharge = 400;
-  int vSpeed = 1000, vAccel = 100, hSpeed = 1000, hAccel = 100, start = 20;
-  int maxTravel = 9600, sgthrs = 0, senseMin = 200, settle = 300;
-  int vMax = 5000, hMax = 9600, toolMax = 0;
-  int homeSpeed = 200, homeBackoff = 200, homeSkew = 200;
-  bool vLimitHoming = false, hLimitHoming = false;
+  int vSpeed = 500, vAccel = 200, hSpeed = 500, hAccel = 200, start = 20;
+  int maxTravel = 10000, sgthrs = 0, senseMin = 100, settle = 300;
+  int toolMax = 0;
+  int homeSpeed = 200, homeBackoff = 200;
+  bool vLimitHoming = true, hLimitHoming = false;
   bool stopDiag = false;
 } cfg;
 int stepsPerMm() { return 25 * cfg.microsteps; } // 200 full steps/rev / 8 mm lead.
@@ -76,7 +76,7 @@ bool configMatch[4] = {};
 uint16_t sg[4] = {};
 int owner = -1, runHoldAxis = -1;
 const char *faultText[] = {"none", "DIAG stall", "USB/browser watchdog/disconnect",
-  "UART/configuration lost", "driver temperature/short/undervoltage", "timer unavailable", "limit input triggered", "homing failed", "motion hold expired"};
+  "UART/configuration lost", "driver temperature/short/undervoltage", "timer unavailable", "limit input triggered", "homing failed", "motion hold expired", "Y homing skew exceeds 1.5 mm"};
 
 void stepsLow() {
   digitalWrite(25, LOW); digitalWrite(14, LOW); digitalWrite(32, LOW);
@@ -119,34 +119,57 @@ void homeTickLocked(int64_t now) {
   if (now - homeStarted > 120000000LL) { fault = 7; haltLocked(false); return; }
   if (now < nextStep) return;
   if (homing == 1) {
-    for (int i=0;i<count;++i) if (digitalRead(LIMIT_PINS[first+i])) homeHit[i] = true;
-    const bool all = homeHit[0] && (count == 1 || homeHit[1]);
-    if (all) {
-      if (!homeContactAt) homeContactAt = now;
-      if (now-homeContactAt < 20000) return;
-      for (int i=0;i<count;++i) if (!digitalRead(LIMIT_PINS[first+i])) { fault=7; haltLocked(false); return; }
-      homing = 2; position[a] = 0; direction = a == 0 ? -1 : 1; remaining = cfg.homeBackoff;
+    // Coarse seek: move the coupled stage only until the first switch opens.
+    bool any = false;
+    for (int i=0;i<count;++i) any = any || digitalRead(LIMIT_PINS[first+i]);
+    if (any) {
+      homing=2; direction=a==0?-1:1; remaining=cfg.homeBackoff;
       digitalWrite(DIR_PINS[a],pinDirection(a,direction)); nextStep=now+5000; return;
     }
-    if (++homePulses > (a==0 ? cfg.vMax : cfg.hMax)+400 ||
-        (count==2 && (homeHit[0] || homeHit[1]) && ++skewPulses > cfg.homeSkew)) {
-      fault=7; haltLocked(false); return;
-    }
-    if (a==0) {
-      if (!homeHit[0]) digitalWrite(25,HIGH);
-      if (!homeHit[1]) digitalWrite(14,HIGH);
-    } else digitalWrite(32,HIGH);
+    if (++homePulses > cfg.maxTravel) { fault=7; haltLocked(false); return; }
+    if (a==0) { digitalWrite(25,HIGH); digitalWrite(14,HIGH); }
+    else digitalWrite(32,HIGH);
     delayMicroseconds(3); stepsLow();
-  } else {
+  } else if (homing == 2) {
     if (a==0) { digitalWrite(25,HIGH); digitalWrite(14,HIGH); }
     else digitalWrite(32,HIGH);
     delayMicroseconds(3); stepsLow(); position[a] += direction;
     if (--remaining==0) {
       for (int i=0;i<count;++i) if (digitalRead(LIMIT_PINS[first+i])) { fault=7; haltLocked(false); return; }
+      homing=3; direction=a==0?1:-1; homeHit[0]=homeHit[1]=false;
+      homePulses=skewPulses=0; homeContactAt=0;
+      digitalWrite(DIR_PINS[a],pinDirection(a,direction)); nextStep=now+5000; return;
+    }
+  } else if (homing == 3) {
+    for (int i=0;i<count;++i) homeHit[i]=digitalRead(LIMIT_PINS[first+i]);
+    const bool all=homeHit[0] && (count==1 || homeHit[1]);
+    if (all) {
+      if (!homeContactAt) homeContactAt=now;
+      if (now-homeContactAt<20000) { nextStep=now+1000; return; }
+      position[a]=0; homeContactAt=0; direction=a==0?-1:1;
+      remaining=a==0?2*stepsPerMm():cfg.homeBackoff; homing=4;
+      digitalWrite(DIR_PINS[a],pinDirection(a,direction)); nextStep=now+5000; return;
+    }
+    homeContactAt=0;
+    if (++homePulses>cfg.maxTravel) { fault=7; haltLocked(false); return; }
+    if (a==0) {
+      if (!homeHit[0]) digitalWrite(25,HIGH);
+      if (!homeHit[1]) digitalWrite(14,HIGH);
+      if ((homeHit[0] != homeHit[1]) && ++skewPulses > int(ceilf(1.5f*stepsPerMm()))) {
+        fault=9; haltLocked(false); return;
+      }
+    } else digitalWrite(32,HIGH);
+    delayMicroseconds(3); stepsLow();
+  } else {
+    if (a==0) { digitalWrite(25,HIGH); digitalWrite(14,HIGH); }
+    else digitalWrite(32,HIGH);
+    delayMicroseconds(3); stepsLow(); position[a]+=direction;
+    if (--remaining==0) {
       zeroed[a]=true; homing=0; completedMove=activeMove; haltLocked(false); return;
     }
   }
-  nextStep=now+1000000LL/cfg.homeSpeed;
+  const int speed=homing==3?max(cfg.start,cfg.homeSpeed/4):cfg.homeSpeed;
+  nextStep=now+1000000LL/speed;
 }
 // No UART/network/heap or catch-up bursts in this 100 us timer callback.
 void motionTick(void *) {
@@ -170,11 +193,12 @@ void motionTick(void *) {
   const int a = activeAxis;
   if (switchHomingEnabled(a) && (a == 0 ? direction > 0 : direction < 0) &&
       (a==0 ? digitalRead(34)||digitalRead(35) : digitalRead(36))) {
-    fault=6; zeroed[a]=false; haltLocked(false); portEXIT_CRITICAL(&mux); return;
+    if (zeroed[a]) { completedMove=activeMove; haltLocked(false); }
+    else { fault=6; haltLocked(false); }
+    portEXIT_CRITICAL(&mux); return;
   }
   const int32_t nextPos = position[a] + direction;
-  if (zeroed[a] && !manualMoveActive &&
-      (a == 0 ? (nextPos>0 || nextPos< -min(cfg.vMax,cfg.toolMax)) : (nextPos<0 || nextPos>cfg.hMax))) {
+  if (zeroed[a] && !manualMoveActive && a==0 && cfg.toolMax>0 && nextPos < -cfg.toolMax) {
     haltLocked(false); portEXIT_CRITICAL(&mux); return;
   }
   const float maxSpeed = moveSpeedCap;
@@ -314,10 +338,9 @@ void startMove(uint8_t client, int axis, long amount, bool absolute, bool isHome
   portEXIT_CRITICAL(&mux);
   if (!allowed) { notice(client, "Arm first; stop the current stage before another move."); return; }
   if (!PRESENT[axis * 2] || !PRESENT[axis * 2 + 1]) { notice(client, "Both drivers must be selected for a coupled stage."); return; }
-  if (!requestId) { notice(client,"Protocol 3 requires an identified held move."); return; }
+  if (!requestId) { notice(client,"Protocol 4 requires an identified held move."); return; }
   if (isHome) {
     if (!switchHomingEnabled(axis) || !PRESENT[axis*2] || !PRESENT[axis*2+1]) { notice(client,"Switch homing is not enabled for this axis or both stage drivers are unavailable."); return; }
-    if (axis==0 ? digitalRead(34)||digitalRead(35) : digitalRead(36)) { notice(client,"Home inputs already open. Check wiring or jog away first."); return; }
   }
   if (absolute && !hasZero) { notice(client, "Set this stage zero first."); return; }
   const int64_t delta = absolute ? int64_t(amount) - pos : amount;
@@ -326,8 +349,9 @@ void startMove(uint8_t client, int axis, long amount, bool absolute, bool isHome
     notice(client, "Move exceeds the per-command step budget or position range."); return;
   }
   if (!isHome && !manualFree && !hasZero && (absolute || abs(amount)>stepsPerMm())) { notice(client,"Unhomed: use held setup increments of at most 1 mm, then set home."); return; }
-  if (!isHome && !manualFree && hasZero &&
-      (axis==0 ? (target>0 || target< -min(cfg.vMax,cfg.toolMax)) : (target<0 || target>cfg.hMax))) { notice(client,"Target exceeds machine/tool travel envelope."); return; }
+  if (!isHome && !manualFree && hasZero && axis==0 && cfg.toolMax>0 && target < -cfg.toolMax) {
+    notice(client,"Target exceeds the installed tooling depth limit."); return;
+  }
   if (!delta && !isHome) {
     portENTER_CRITICAL(&mux); completedMove=requestId; portEXIT_CRITICAL(&mux);
     acknowledge(client,true,"Already at target."); return;
@@ -360,7 +384,7 @@ String settingsJSON() {
   FIELD(microsteps) FIELD(current) FIELD(hold) FIELD(precharge)
   FIELD(vSpeed) FIELD(vAccel) FIELD(hSpeed) FIELD(hAccel) FIELD(start)
   FIELD(maxTravel) FIELD(sgthrs) FIELD(senseMin) FIELD(settle)
-  FIELD(vMax) FIELD(hMax) FIELD(toolMax) FIELD(homeSpeed) FIELD(homeBackoff) FIELD(homeSkew)
+  FIELD(toolMax) FIELD(homeSpeed) FIELD(homeBackoff)
 #undef FIELD
   s += "\"vLimitHoming\":" + String(cfg.vLimitHoming ? "true" : "false") + ",";
   s += "\"hLimitHoming\":" + String(cfg.hLimitHoming ? "true" : "false") + ",";
@@ -397,7 +421,7 @@ void sendTelemetry() {
       ",\"ifcntAfter\":" + String(unsigned(ifcntAfter[i])) +
       ",\"diag\":" + digitalRead(DIAG_PINS[i]) + ",\"edges\":" + edges[i] + "}";
   }
-  s += "],\"protocol\":3,\"stepsPerMm\":"+String(stepsPerMm())+",\"moveId\":"+move+",\"completedId\":"+done+",\"homing\":"+home;
+  s += "],\"protocol\":4,\"stepsPerMm\":"+String(stepsPerMm())+",\"moveId\":"+move+",\"completedId\":"+done+",\"homing\":"+home;
   s += ",\"limits\":["+String(cfg.vLimitHoming?digitalRead(34):-1)+","+String(cfg.vLimitHoming?digitalRead(35):-1)+","+String(cfg.hLimitHoming?digitalRead(36):-1)+"]";
   s += ",\"transport\":\"usb\"";
   s += ",\"settings\":"+settingsJSON()+"}"; Serial.print('@'); Serial.println(s);
@@ -414,7 +438,7 @@ void onLink(uint8_t client, int type, const String &input) {
   if (type == LINK_CONNECTED) {
     // A new browser session must never inherit an armed session after a quick USB reconnect.
     if (owner == client) { latchFault(2); owner = -1; }
-    String s = String("{\"type\":\"hello\",\"id\":") + client + ",\"protocol\":3,\"stepsPerMm\":"+String(stepsPerMm())+",\"settings\":" + settingsJSON() + "}";
+    String s = String("{\"type\":\"hello\",\"id\":") + client + ",\"protocol\":4,\"stepsPerMm\":"+String(stepsPerMm())+",\"settings\":" + settingsJSON() + "}";
     Serial.print('@'); Serial.println(s); return;
   }
   if (type != LINK_TEXT || input.length() > 96) return;
@@ -516,9 +540,9 @@ void applySettings(const String &form, long id) {
     {"vAccel",&next.vAccel,10,40000}, {"hSpeed",&next.hSpeed,20,10000},
     {"hAccel",&next.hAccel,10,40000}, {"start",&next.start,5,2000},
     {"maxTravel",&next.maxTravel,1,1000000}, {"sgthrs",&next.sgthrs,0,255},
-    {"senseMin",&next.senseMin,50,10000}, {"settle",&next.settle,100,2000},
-    {"vMax",&next.vMax,1,160000}, {"hMax",&next.hMax,1,307200}, {"toolMax",&next.toolMax,0,160000},
-    {"homeSpeed",&next.homeSpeed,20,10000}, {"homeBackoff",&next.homeBackoff,20,12800}, {"homeSkew",&next.homeSkew,1,12800}
+    {"senseMin",&next.senseMin,1,10000}, {"settle",&next.settle,100,2000},
+    {"toolMax",&next.toolMax,0,160000},
+    {"homeSpeed",&next.homeSpeed,20,10000}, {"homeBackoff",&next.homeBackoff,20,12800}
   };
   for (auto &field : fields) {
     long value;
@@ -534,13 +558,10 @@ void applySettings(const String &form, long id) {
     settingsReply(id,400,"Microstepping, start speed, or DIAG value invalid."); return;
   }
   const String vHome = formArg(form,"vLimitHoming"), hHome = formArg(form,"hLimitHoming");
-  const int nextStepsPerMm = 25 * next.microsteps;
   if ((vHome!="0" && vHome!="1") || (hHome!="0" && hHome!="1") ||
-      next.vMax>25*nextStepsPerMm || next.hMax>48*nextStepsPerMm ||
-      next.toolMax>next.vMax || next.homeBackoff>min(next.vMax,next.hMax)) {
+      next.homeBackoff>next.maxTravel) {
     settingsReply(id,400,"Invalid homing mode, backoff, or tool envelope."); return;
   }
-  if (next.microsteps != cfg.microsteps) next.toolMax = 0;
   next.vLimitHoming=vHome=="1"; next.hLimitHoming=hHome=="1";
   next.stopDiag = formArg(form,"stopDiag") == "1";
   portENTER_CRITICAL(&mux); cfg = next; portEXIT_CRITICAL(&mux);
@@ -601,7 +622,7 @@ void setup() {
   if (esp_timer_create(&args, &pulseTimer) != ESP_OK || esp_timer_start_periodic(pulseTimer, 100) != ESP_OK) {
     pulseTimer = nullptr; ready = false; fault = 5;
   }
-  Serial.printf("Press Brake USB protocol 3: %dx microsteps, %d steps/mm. Axis-specific switch homing and DIAG off by default.\n", cfg.microsteps, stepsPerMm());
+  Serial.printf("Press Brake USB protocol 4: %dx microsteps, %d steps/mm. Axis-specific switch homing and DIAG off by default.\n", cfg.microsteps, stepsPerMm());
 }
 void loop() {
   serviceUsb();
